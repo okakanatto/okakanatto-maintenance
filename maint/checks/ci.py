@@ -67,7 +67,7 @@ def parse_workflow(text: str) -> dict:
 
 
 def _action_runtime(ctx: Context, ref: str) -> str | None:
-    """owner/repo[/path]@ref → runs.using（node20 等）。取得できなければ None。"""
+    """owner/repo[/path]@ref → runs.using（node20 等）。action.yml が無ければ None、取得失敗なら "ERROR"。"""
     cache = ctx.cache.setdefault("action_runtime", {})
     if ref in cache:
         return cache[ref]
@@ -81,7 +81,7 @@ def _action_runtime(ctx: Context, ref: str) -> str | None:
             try:
                 raw = ctx.reader.file(repo, path, version)
             except HttpError:
-                raw = None
+                runtime = "ERROR"  # 一時的な失敗。この回は陳腐化を判定できない
                 break
             if raw:
                 m = re.search(r"^\s*using:\s*['\"]?([\w.-]+)", raw.decode("utf-8", "replace"), re.M)
@@ -150,7 +150,13 @@ def check_ci(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
             if when and (ctx.now - when).days > stale_days:
                 r.notes.append(f"{path}: 既定ブランチで {(ctx.now - when).days} 日実行なし")
         elif total == 0:
-            wf = parse_workflow(_text(ctx, inv, path) or "")
+            text = _text(ctx, inv, path)
+            if text is None:
+                run_ok = False
+                r.fail(f"{path} の本文を取得できない（トリガーを判定できない）")
+                r.verified_scopes.remove(f"ci:{repo.id}:{wid}")
+                continue
+            wf = parse_workflow(text)
             if set(wf["triggers"]) & {"push", "schedule"}:
                 r.findings.append(_f(repo, f"ci-never-run:{repo.id}:{wid}", LOW, f"[CI] {repo.name}: {w.get('name')} が一度も実行されていない",
                                      "push/schedule トリガーがあるのに実行履歴が 0 件。リポジトリの Actions が無効になっている可能性がある",
@@ -201,6 +207,10 @@ def _static(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> bool:
                 continue
             uses_all.append({"uses": ref, "comment": comment, "file": path})
             rt = _action_runtime(ctx, ref)
+            if rt == "ERROR":
+                ok = False
+                r.fail(f"{ref} の action.yml を取得できない（実行環境を判定できない）")
+                continue
             if rt is None:
                 unknown_runtime.append(ref)
                 continue
@@ -223,7 +233,9 @@ def _static(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> bool:
                              "node24 対応の最新メジャー版へ更新する（SHA 固定なら新しいタグの SHA に差し替える）",
                              {"actions": {n: {"runtime": e["runtime"], "refs": sorted(e["refs"])} for n, e in sorted(by_action.items())}},
                              [f"ci-static:{repo.id}"]))
-    images = _runner_images(ctx, r)
+    images, images_ok = _runner_images(ctx, r)
+    if not images_ok:
+        ok = False
     for label, files in sorted(by_runner.items()):
         eol = None
         if images is not None and label in images:
@@ -244,13 +256,16 @@ def _static(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> bool:
     return ok
 
 
-def _runner_images(ctx: Context, r: CheckResult) -> dict | None:
+def _runner_images(ctx: Context, r: CheckResult) -> tuple[dict | None, bool]:
+    """(ランナー名 → サイクル, 取得できたか)。製品が無い（404）ときは設定の retired_runners だけで判定してよい。"""
     try:
         rels = product_releases(ctx, "github-actions-runner-images")
     except HttpError as e:
-        r.notes.append(f"ランナーイメージの提供期限を取得できない（{e.kind}）。設定の retired_runners のみで判定")
-        return None
-    return {x["name"]: x for x in rels or []}
+        r.fail(f"ランナーイメージの提供期限を取得できない（{e.kind}）。設定の retired_runners のみで判定")
+        return None, False
+    if rels is None:
+        return None, True
+    return {x["name"]: x for x in rels if isinstance(x, dict) and x.get("name")}, True
 
 
 def _f(repo, key, sev, title, summary, evidence, rec, material, verify, unverified=None) -> Finding:

@@ -95,7 +95,9 @@ def check_release(ctx: Context, repo: Repo, inv: Inventory) -> tuple[CheckResult
             r.fail(f"{tag} 時点のツリーを取得できません: {e.kind}")
             r.cover("release", UNKNOWN, f"{tag} 時点のソースを取得できない")
             return r, None
-    note = f"{tag} 時点のソースの依存定義で推定。配布バイナリとソースの一致は未検証"
-    note += "（SBOM 添付あり・未解析）" if data["sbom_attached"] else "（SBOM・来歴証明なし）"
-    r.cover("release", COV_PARTIAL, note)
+    # 配布物の安全性そのものは断定できない。SBOM も無ければ UNKNOWN（タグ時点のソースでの推定は Issue の「範囲」に出す）
+    if data["sbom_attached"]:
+        r.cover("release", COV_PARTIAL, f"{tag} 時点のソースで推定。SBOM 添付あり（未解析）。配布バイナリとソースの一致は未検証")
+    else:
+        r.cover("release", UNKNOWN, f"{tag} 時点のソースの依存定義で推定のみ。SBOM・来歴証明が無く、配布バイナリとソースの一致は不明")
     return r, rel_inv

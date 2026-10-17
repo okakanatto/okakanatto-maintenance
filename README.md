@@ -78,7 +78,7 @@ gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 | ロックファイルの無い依存定義（`package.json` だけ等） | 未対応 | 版が確定しないため照合できない |
 | Git サブモジュール | 部分 | OSV のコミット照合は OSV が索引した上流だけ有効。0 件は安全の根拠にならない |
 | C/C++ のソース・vcpkg・Conan・Qt・Tesseract 等 | 未対応（Qt の EOL は対応） | OSV にエコシステムが無い。vcpkg 一覧はレポートに出し、月次点検で人が確認 |
-| 配布バイナリ（exe・zip） | 部分／不明 | タグ時点のソースで推定するだけ。バイナリとソースの一致・SBOM は未検証。ソース非公開なら「不明」 |
+| 配布バイナリ（exe・zip） | 不明（SBOM 添付時は部分） | 配布物の安全性は断定しない。タグ時点のソースの依存は同じく照合し、Issue の「範囲」にタグ名で出す。バイナリとソースの一致は未検証 |
 | Dependabot alerts | 任意 | 読み取りトークンがあれば追加の情報源にする（無ければ OSV だけで成立） |
 | 到達可能性（脆弱なコードを実際に使っているか） | 未対応 | Issue の「未検証事項」に毎回書く |
 | 未 push の変更・手元のビルド環境・Windows 上の実動作 | 対象外 | 監視の正本は GitHub 上のリモート |
@@ -89,7 +89,9 @@ gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 - 脆弱性は**リポジトリ × エコシステム × 本番/開発用**に束ねます。1 回の依存更新で片付く単位で、勧告ごとに Issue を作って埋もれるのを防ぐためです。個々の勧告は本文の表にあります
 - **通知を出すのは**: 新規作成・内容の変化（勧告の増減、重要度、範囲）・解消・再発・抑制期限切れ のときだけ。変化がなければ何もしません（最終確認日時は 7 日ごとに本文だけ更新）
 - **自動で閉じるのは**、同じ範囲の検査が今回成功し、検出が無かったときだけ。取得失敗・レート制限・権限不足・スキャナ未対応・リポジトリ消失・その周期の検査が今回走っていない、のいずれでも閉じません
-- **人が閉じた Issue は再オープンしません**（ツールが閉じた `maint:resolved` のものだけ、再発時に再オープン）
+- **人が閉じた Issue は再オープンしません**（ツールが閉じた `maint:resolved` のものだけ、再発時に再オープン）。
+  ただし束ねた Issue に新しい勧告が入った・重要度が上がったときは、閉じたまま 1 回だけコメントで知らせます
+- 検査の一部が失敗した日は、その Issue の内容を書き換えません（一時的な失敗で「変わりました」が往復しないため）
 - 同じ検査が 3 回続けて失敗すると `kind:health` の Issue で知らせます（監視できていない範囲の放置を防ぐ）
 
 ### 重要度と対応目安
@@ -115,7 +117,7 @@ gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 ```
 - キーは Issue 本文末尾の `maint-key`。脆弱性は勧告 1 件（`vuln:<リポジトリID>:<GHSA/CVE/RUSTSEC>`）単位でも指定できます
 - 抑制中は新規作成もコメントもしません。期限を過ぎるとラベル `maint:suppressed` を外して 1 回だけ知らせます
-- Issue を手で閉じても抑止できますが、期限付きの再評価にはなりません（そのまま閉じたまま）
+- 束ねた Issue を手で閉じるより、勧告ごとに抑制するほうが確実です（手で閉じると期限付きの再評価になりません）
 
 ## 認証・権限
 
@@ -129,6 +131,18 @@ gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 - `GITHUB_TOKEN` は自分のリポジトリにしか書けず、他リポジトリの Dependabot alerts は読めません。トークン未設定でも OSV で脆弱性監視は成立し、ダッシュボードに「Dependabot alerts: 未取得」と出ます
 - 書き込みは中央リポジトリ宛てだけに制限してあり（`IssueWriter`）、他リポジトリへの書き込みはコード上で拒否されます
 - 外部由来の文字列（勧告の要約など）は `@メンション`・`#番号`・他リポジトリ Issue への自動リンクを無効化してから Issue に書きます（相手側へ通知・相互参照を出さない）
+
+## 認証・権限が足りないとき（症状と対処）
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| ジョブが失敗し、実行状態が ERROR（「Issue 同期に失敗」「中央リポジトリの Issue を読めない」） | Issue の書き込み権限が無い | ワークフローの `permissions: issues: write` を消していないか、Settings → Actions → General → Workflow permissions を確認 |
+| あるリポジトリの検査が「失敗」（403/404） | 一覧には出たが読めない（権限消失・API 障害） | その範囲の Issue は閉じない。3 回続くと `kind:health` の Issue。原因を確認する |
+| 「rate_limited」で一部失敗 | 1 時間あたりの API 上限 | 待たずに失敗として記録し翌日再試行。頻発するなら `MAINT_READ_TOKEN` で読み取りを分ける |
+| ダッシュボードに「Dependabot alerts: 未取得」 | トークン未設定（既定） | 任意。必要なら「認証・権限」の表のとおり設定 |
+| `vuln.dependabot` が「未対応」 | そのリポジトリで alerts が無効 | 任意。アプリ側の Settings → Code security で有効化 |
+| `vuln.dependabot` が「不明」 | トークンの権限不足・期限切れ（401/403） | トークンを作り直す。その回は脆弱性 Issue を閉じない |
+| ローカル実行で「GITHUB_TOKEN が無い」 | 環境変数なし | `GITHUB_TOKEN=$(gh auth token)` を付ける（未認証は 60 回/時で足りない） |
 
 ## 監視停止（定期実行が止まったとき）
 

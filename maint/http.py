@@ -136,8 +136,15 @@ class HttpClient:
         json_body=None,
         raw: bool = False,
         ok_statuses: tuple[int, ...] = (200, 201, 204),
+        idempotent: bool | None = None,
     ) -> tuple[object, Response]:
-        """成功時は (解析済み JSON または bytes, Response)。失敗時は HttpError。"""
+        """成功時は (解析済み JSON または bytes, Response)。失敗時は HttpError。
+
+        idempotent=False（既定では GitHub への POST）は、5xx・タイムアウト・通信断で再送しない。
+        サーバー側で処理済みだった場合に Issue やコメントが二重になるため。レート制限（未処理が確実）だけは再送する。
+        """
+        if idempotent is None:
+            idempotent = not (method == "POST" and "api.github.com" in url)
         hdrs = {"User-Agent": USER_AGENT}
         hdrs.update(headers or {})
         body = None
@@ -183,6 +190,8 @@ class HttpClient:
                 else:
                     raise HttpError("client", url, resp.status, _message(resp))
             if attempt >= self.max_retries:
+                break
+            if not idempotent and last_err.kind != "rate_limited":
                 break
             wait = self._wait_seconds(resp, attempt)
             if wait > self.max_wait:

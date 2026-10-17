@@ -116,10 +116,12 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
     r = CheckResult("vuln")
     if inv.empty:
         r.cover("vuln", NOT_APPLICABLE, "コード未登録（空リポジトリ）")
-        r.verified_scopes += [f"vuln:{repo.id}:*", f"vuln-release:{repo.id}"]
+        r.verified_scopes += [f"vuln:{repo.id}:*", f"vuln-release:{repo.id}:*"]
         return r
+    tokens_ok = True  # False になったら、この検査では解消判定用のトークンを一切出さない
     if inv.truncated:
         r.fail("ツリーが大きすぎて一部しか取得できていない（未取得部分の依存定義は未検査）")
+        tokens_ok = False
 
     scopes: list[tuple[str, Inventory]] = [("default", inv)]
     tag = (release_res.data or {}).get("latest_tag") if release_res else None
@@ -127,7 +129,8 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
         scopes.append(("release", rel_inv))
 
     all_pkgs: list[tuple[str, Package]] = []
-    release_ok = True
+    default_ok: set[str] = set()  # 既定ブランチで最後まで照合できたエコシステム
+    release_seen: dict[str, bool] = {}  # タグ時点: エコシステム -> 最後まで照合できたか
     for scope, sinv in scopes:
         pkgs, status = collect_packages(ctx, sinv)
         all_pkgs += [(scope, p) for p in pkgs]
@@ -136,11 +139,11 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
             if scope == "default":
                 r.cover(f"vuln.{eco}", level, note)
                 if verified:
-                    r.verified_scopes.append(f"vuln:{repo.id}:{eco}")
+                    default_ok.add(eco)
                 elif s["failed"]:
                     r.fail(f"{eco}: " + "; ".join(s["failed"]))
-            elif not verified and (s["failed"] or not s["parsed"]):
-                release_ok = False
+            else:
+                release_seen[eco] = verified
                 if s["failed"]:
                     r.fail(f"{tag} 時点の {eco}: " + "; ".join(s["failed"]))
     if rel_inv is inv:
@@ -152,6 +155,9 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
             r.cover("vuln.source", UNSUPPORTED, "ソース・依存定義が非公開。配布バイナリの中身は検査できない")
         else:
             r.cover("vuln.source", NOT_APPLICABLE, "ソースコードなし")
+    elif not r.coverage and not inv.submodules:
+        # 対応形式の依存定義が 1 つも無い（build.gradle だけ等）。「問題なし」とは言えない
+        r.cover("vuln", UNKNOWN, "認識できる依存定義が無い（未対応の形式か、依存が無い）")
 
     # OSV 照合
     hits: dict[str, list[tuple[str, Package]]] = defaultdict(list)
@@ -160,7 +166,6 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
             res = ctx.osv.query_packages([p for _, p in all_pkgs])
         except HttpError as e:
             r.fail(f"OSV 照合に失敗: {e.kind} ({e.status})", fatal=True)
-            r.verified_scopes = [t for t in r.verified_scopes if not t.startswith("vuln:")]
             for area, item in r.coverage.items():
                 if area.startswith("vuln.") and item.level in (SUPPORTED, COV_PARTIAL) and area not in ("vuln.submodule",):
                     r.cover(area, UNKNOWN, "OSV 照合に失敗（今回は未検査）")
@@ -170,7 +175,7 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
                 hits[vid].append((scope, p))
 
     # サブモジュール（固定コミット）を OSV のコミット照合にかける
-    sub_hits = _submodule_commits(ctx, repo, inv, r)
+    sub_hits, sub_ok = _submodule_commits(ctx, repo, inv, r)
     for vid, entries in sub_hits.items():
         hits[vid].extend(entries)
 
@@ -180,21 +185,39 @@ def check_vuln(ctx: Context, repo: Repo, inv: Inventory, release_res: CheckResul
             details[vid] = ctx.osv.get(vid)
         except HttpError as e:
             r.fail(f"OSV 詳細の取得に失敗: {vid} ({e.kind})")
-            r.verified_scopes = [t for t in r.verified_scopes if not t.startswith("vuln:")]
+            tokens_ok = False
 
-    _dependabot(ctx, repo, r, details, hits)
+    if not _dependabot(ctx, repo, r, details, hits):
+        tokens_ok = False
 
-    if release_res is None or release_res.status == "ERROR":
-        release_ok = False
-    elif rel_inv is None and (release_res.data or {}).get("releases") and inv.has_source:
-        release_ok = False  # リリースはあるがタグ時点を検査できなかった
-    if release_ok and r.status != "ERROR":
-        r.verified_scopes.append(f"vuln-release:{repo.id}")
+    if tokens_ok:
+        r.verified_scopes += [f"vuln:{repo.id}:{eco}" for eco in sorted(default_ok)]
+        if sub_ok:
+            r.verified_scopes.append(f"vuln:{repo.id}:GIT")
+        r.verified_scopes += _release_tokens(repo, inv, release_res, rel_inv, default_ok, release_seen, sub_ok)
 
     r.findings += bucket_findings(ctx, repo, details, hits, tag, rel_inv is not None)
     r.data["packages_checked"] = len({(p.ecosystem, p.name, p.version) for _, p in all_pkgs})
     r.data["scopes"] = [{"scope": s, "ref": i.ref, "commit": i.commit_sha[:12]} for s, i in scopes]
     return r
+
+
+def _release_tokens(repo: Repo, inv: Inventory, release_res, rel_inv, default_ok: set[str], release_seen: dict[str, bool], sub_ok: bool) -> list[str]:
+    """配布版（最新リリースのタグ時点）について、エコシステムごとに「確認できた」トークンを出す。"""
+    if release_res is None or release_res.status == "ERROR":
+        return []
+    if not (release_res.data or {}).get("releases"):
+        return [f"vuln-release:{repo.id}:*"]  # 配布物が無い＝配布版に残る問題は無い
+    if rel_inv is None:
+        return []  # リリースはあるがタグ時点を検査できなかった（ソース非公開・取得失敗）
+    if rel_inv is inv:
+        ecos = set(default_ok) | ({"GIT"} if sub_ok else set())
+    else:
+        # タグ時点に存在しないエコシステムは「配布物に含まれない」として確認済み
+        ecos = {e for e, ok in release_seen.items() if ok} | {e for e in default_ok if e not in release_seen}
+        if sub_ok:
+            ecos.add("GIT")
+    return [f"vuln-release:{repo.id}:{e}" for e in sorted(ecos)]
 
 
 def _native_coverage(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> None:
@@ -219,10 +242,10 @@ def _native_coverage(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -
         r.cover("vuln.native", UNSUPPORTED, f"C/C++ ソース {inv.native_sources} 件。同梱・システム依存ライブラリの既知脆弱性は自動照合できない")
 
 
-def _submodule_commits(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> dict[str, list[tuple[str, Package]]]:
+def _submodule_commits(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult) -> tuple[dict[str, list[tuple[str, Package]]], bool]:
     out: dict[str, list[tuple[str, Package]]] = defaultdict(list)
     if not inv.submodules:
-        return out
+        return out, True
     ok = True
     notes = []
     for sm in inv.submodules:
@@ -236,7 +259,8 @@ def _submodule_commits(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult)
         for vid in ids:
             out[vid].append(("default", pkg))
         notes.append(f"{sm['path']}@{sm['sha'][:10]}: OSV {len(ids)} 件")
-        adv = _upstream_advisories(ctx, repo, sm, r)
+        adv, adv_ok = _upstream_advisories(ctx, repo, sm, r)
+        ok = ok and adv_ok
         if adv:
             notes.append(adv)
     level = COV_PARTIAL if ok else UNKNOWN
@@ -245,22 +269,22 @@ def _submodule_commits(ctx: Context, repo: Repo, inv: Inventory, r: CheckResult)
         level,
         "; ".join(notes) + "。OSV のコミット照合は OSV が索引した上流でのみ有効で、0 件は安全の根拠にならない",
     )
-    if ok:
-        r.verified_scopes.append(f"vuln:{repo.id}:GIT")
-    return out
+    return out, ok
 
 
-def _upstream_advisories(ctx: Context, repo: Repo, sm: dict, r: CheckResult) -> str:
+def _upstream_advisories(ctx: Context, repo: Repo, sm: dict, r: CheckResult) -> tuple[str, bool]:
+    """(注記, 取得できたか)"""
     url = sm.get("url") or ""
     if "github.com/" not in url:
-        return ""
+        return "", True
     full = url.split("github.com/", 1)[1].removesuffix(".git").strip("/")
     try:
         advs = ctx.reader.security_advisories(full)
     except HttpError as e:
-        return f"上流 {full} の公開勧告を取得できない（{e.kind}）"
+        r.fail(f"上流 {full} の公開勧告を取得できない（{e.kind}）")
+        return f"上流 {full} の公開勧告を取得できない（{e.kind}）", False
     if not advs:
-        return f"上流 {full} の公開セキュリティ勧告 0 件"
+        return f"上流 {full} の公開セキュリティ勧告 0 件", True
     r.findings.append(
         Finding(
             key=f"vuln-upstream:{repo.id}:{sm['path']}",
@@ -275,28 +299,28 @@ def _upstream_advisories(ctx: Context, repo: Repo, sm: dict, r: CheckResult) -> 
             unverified=["固定コミットが勧告の影響範囲に入るか"],
             scope=[f"サブモジュール {sm['path']}@{sm['sha'][:10]}"],
             material={"ids": sorted(a.get("ghsa_id", "") for a in advs)},
-            verify=[f"vuln:{repo.id}:GIT"],
+            verify=[f"vuln:{repo.id}:GIT", f"vuln-release:{repo.id}:GIT"],
         )
     )
-    return f"上流 {full} の公開勧告 {len(advs)} 件（要確認）"
+    return f"上流 {full} の公開勧告 {len(advs)} 件（要確認）", True
 
 
 DEPENDABOT_ECO = {"npm": "npm", "rust": "crates.io", "pip": "PyPI", "go": "Go", "nuget": "NuGet", "composer": "Packagist", "maven": "Maven", "rubygems": "RubyGems"}
 
 
-def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vuln], hits) -> None:
+def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vuln], hits) -> bool:
+    """取得に失敗したら False（その回は脆弱性 Issue を閉じない）。"""
     if ctx.dependabot is None:
-        return  # 全リポジトリ共通の設定なので、レポート冒頭に 1 回だけ表示する（runner）
+        return True  # 全リポジトリ共通の設定なので、レポート冒頭に 1 回だけ表示する（runner）
     try:
         alerts = ctx.dependabot.dependabot_alerts(repo.full_name)
     except HttpError as e:
         if e.kind == "forbidden" and "disabled" in e.message.lower():
             r.cover("vuln.dependabot", UNSUPPORTED, "このリポジトリで Dependabot alerts が無効")
-        else:
-            r.cover("vuln.dependabot", UNKNOWN, f"取得失敗: {e.kind} ({e.status})")
-            r.fail(f"Dependabot alerts の取得に失敗: {e.kind}（今回は脆弱性 Issue を閉じない）")
-            r.verified_scopes = [t for t in r.verified_scopes if not t.startswith("vuln")]
-        return
+            return True
+        r.cover("vuln.dependabot", UNKNOWN, f"取得失敗: {e.kind} ({e.status})")
+        r.fail(f"Dependabot alerts の取得に失敗: {e.kind}（今回は脆弱性 Issue を閉じない）")
+        return False
     known = set(details)
     for v in details.values():
         known |= set(v.aliases)
@@ -328,6 +352,7 @@ def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vul
         eco = DEPENDABOT_ECO.get(str(pkg.get("ecosystem")), str(pkg.get("ecosystem")))
         hits[ghsa].append(("default", Package(eco, str(pkg.get("name")), "?", str(dep.get("manifest_path")), dev=(dep.get("scope") == "development"))))
     r.cover("vuln.dependabot", SUPPORTED, f"open {len(alerts)} 件（OSV に無いもの {extra} 件）")
+    return True
 
 
 def _group(details: dict[str, Vuln]) -> list[list[str]]:
@@ -386,13 +411,10 @@ def bucket_findings(ctx: Context, repo: Repo, details: dict[str, Vuln], hits, ta
     downgrade = ctx.policy("issue_policy", "dev_only_downgrade", True, repo.id, repo.name)
     buckets: dict[tuple[str, str], dict] = {}
     info_pkgs: list[str] = []
-    suppressed_adv: list[str] = []
     for group in _group(details):
         adv = _advisory_view(group, details)
         sup = ctx.cfg.suppression_for(f"vuln:{repo.id}:{adv['id']}", adv["aliases"])
-        if sup and sup.active(ctx.today):
-            suppressed_adv.append(f"{adv['id']}（{sup.status}、{sup.until or '期限なし'}まで: {sup.reason}）")
-            continue
+        is_sup = bool(sup and sup.active(ctx.today))
         entries = sorted({(s, p) for i in group for s, p in hits[i]}, key=lambda x: (x[1].ecosystem, x[1].name, x[1].version, x[1].path, x[0]))
         for scope, p in entries:
             if adv["informational"] and adv["severity"] == INFO:
@@ -400,9 +422,12 @@ def bucket_findings(ctx: Context, repo: Repo, details: dict[str, Vuln], hits, ta
                 info_pkgs.append(f"{p.name} {p.version}（{adv['id']}: {kinds}）")
                 continue
             eco = p.ecosystem
-            same = [q for s2, q in entries if s2 == "default" and q.name == p.name]
+            same = [q for _, q in entries if q.name == p.name]  # main とタグの両方を見る（タグにだけ残る dev 依存を prod にしない）
             kind = "dev" if same and all(q.dev for q in same) else "prod"
-            b = buckets.setdefault((eco, kind), {"pkgs": {}, "advs": {}})
+            b = buckets.setdefault((eco, kind), {"pkgs": {}, "advs": {}, "sup": {}})
+            if is_sup:
+                b["sup"][adv["id"]] = (adv, f"{adv['id']}（{sup.status}、{sup.until or '期限なし'}まで: {sup.reason}）")
+                continue
             pk = b["pkgs"].setdefault((p.name, p.version), {"name": p.name, "version": p.version, "paths": set(), "scopes": set(), "advs": set()})
             pk["paths"].add(p.path)
             pk["scopes"].add("main" if scope == "default" else (tag or "release"))
@@ -411,6 +436,19 @@ def bucket_findings(ctx: Context, repo: Repo, details: dict[str, Vuln], hits, ta
     out: list[Finding] = []
     for (eco, kind), b in sorted(buckets.items()):
         advs = b["advs"]
+        suppressed_adv = [txt for _, txt in b["sup"].values()]
+        if not advs:
+            # 束の中身がすべて抑制中。Issue は作らず、既存なら抑制ラベルを付けて静かにする（期限切れで 1 回だけ知らせる）
+            sup_sev = max((a["severity"] for a, _ in b["sup"].values()), key=lambda x: SEVERITY_RANK[x])
+            label = ECO_JA.get(eco, eco) + ("（開発用）" if kind == "dev" else "")
+            out.append(Finding(
+                key=f"vuln:{repo.id}:{eco}:{kind}", kind="vuln", repo_id=repo.id, repo_name=repo.name,
+                title=f"[脆弱性] {repo.name}: {label} 依存の勧告 {len(b['sup'])} 件はすべて抑制中",
+                severity=sup_sev, summary="抑制中の勧告（suppressions.json）: " + "; ".join(suppressed_adv[:10]),
+                recommendation="- 再評価期限が来たら内容を確認する", material={"advisories": [], "suppressed": sorted(b["sup"])},
+                issue=False, suppressed=True, verify=[f"vuln:{repo.id}:{eco}", f"vuln-release:{repo.id}:{eco}"],
+            ))
+            continue
         sev = max((a["severity"] for a in advs.values()), key=lambda s: SEVERITY_RANK[s])
         orig_sev = sev
         unverified = ["アプリから脆弱なコードが実際に呼ばれるか（到達可能性）"]
@@ -481,9 +519,10 @@ def bucket_findings(ctx: Context, repo: Repo, details: dict[str, Vuln], hits, ta
                 "advisories": sorted(advs),
                 "packages": sorted(f"{pk['name']}@{pk['version']}" for pk in pkgs),
                 "where": where,
+                **({"suppressed": sorted(b["sup"])} if b["sup"] else {}),
             },
             issue=sev != INFO and severity_at_least(sev, min_sev),
-            verify=[f"vuln:{repo.id}:{eco}", f"vuln-release:{repo.id}"],
+            verify=[f"vuln:{repo.id}:{eco}", f"vuln-release:{repo.id}:{eco}"],
         ))
     if info_pkgs:
         items = sorted(set(info_pkgs))

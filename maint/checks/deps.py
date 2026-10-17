@@ -78,9 +78,10 @@ def pypi_info(ctx: Context, name: str, version: str) -> dict:
 LOOKUP = {"npm": npm_info, "crates.io": crate_info, "PyPI": pypi_info}
 
 
-def _direct_deps(ctx: Context, inv: Inventory, r: CheckResult) -> list[dict]:
-    """[{eco, name, version, spec, dev, path}]"""
+def _direct_deps(ctx: Context, inv: Inventory, r: CheckResult) -> tuple[list[dict], set[str]]:
+    """([{eco, name, version, spec, dev, path}], 読めなかったエコシステム)。同じ依存が複数ファイルにあれば 1 件にまとめる。"""
     out: list[dict] = []
+    failed: set[str] = set()
     installed: dict[tuple[str, str], str] = {}
     for m in inv.manifests:
         if m.kind in ("npm-lock", "cargo-lock", "pip-requirements"):
@@ -88,6 +89,7 @@ def _direct_deps(ctx: Context, inv: Inventory, r: CheckResult) -> list[dict]:
                 pkgs, _ = PARSERS[m.kind](read_blob(ctx.reader, inv, m.path), m.path)
             except (HttpError, ParseError) as e:
                 r.fail(f"{m.path} を読めない: {e}")
+                failed.add(m.ecosystem)
                 continue
             for p in pkgs:
                 if m.kind == "npm-lock" and not p.direct:
@@ -107,12 +109,22 @@ def _direct_deps(ctx: Context, inv: Inventory, r: CheckResult) -> list[dict]:
                 continue
         except (HttpError, ParseError, ValueError) as e:
             r.fail(f"{m.path} を読めない: {e}")
+            failed.add(m.ecosystem)
             continue
         for name, meta in direct.items():
             v = installed.get((eco, name))
             if v:
                 out.append({"eco": eco, "name": name, "version": v, "spec": meta["spec"], "dev": meta["dev"], "path": m.path})
-    return out
+    merged: dict[tuple[str, str, str], dict] = {}
+    for d in out:
+        k = (d["eco"], d["name"], d["version"])
+        if k in merged:
+            g = merged[k]
+            g["path"] = ", ".join(sorted(set(g["path"].split(", ")) | {d["path"]}))
+            g["dev"] = bool(g["dev"]) and bool(d["dev"])  # どこかで本番依存なら本番扱い
+        else:
+            merged[k] = dict(d)
+    return list(merged.values()), failed
 
 
 def check_deps(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
@@ -120,10 +132,12 @@ def check_deps(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
     if inv.empty or not inv.has_source:
         r.cover("deps", NOT_APPLICABLE if inv.empty else UNSUPPORTED, "コード未登録" if inv.empty else "依存定義が非公開")
         return r
-    deps = _direct_deps(ctx, inv, r)
+    deps, read_failed = _direct_deps(ctx, inv, r)
+    if inv.truncated:
+        r.fail("ツリーが大きすぎて一部しか取得できていない（未取得部分の依存定義は未検査）")
     major_threshold = ctx.policy("update_policy", "major_lag_issue", 2, repo.id, repo.name)
     rows = []
-    failed_ecos: set[str] = set()
+    failed_ecos: set[str] = set(read_failed)
     for d in deps:
         fn = LOOKUP.get(d["eco"])
         if not fn:
@@ -162,8 +176,9 @@ def check_deps(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
                 scope=[f"{d['path']}（直接依存）"], unverified=["旧メジャーにまだ修正が提供されているか"],
                 material={"from_major": d["version"].split(".")[0], "lag": lag}, verify=[f"deps:{repo.id}:{d['eco']}"],
             ))
-    for eco in sorted({d["eco"] for d in deps} - failed_ecos):
-        r.verified_scopes.append(f"deps:{repo.id}:{eco}")
+    if not inv.truncated:
+        for eco in sorted({d["eco"] for d in deps} - failed_ecos):
+            r.verified_scopes.append(f"deps:{repo.id}:{eco}")
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["update"]] = counts.get(row["update"], 0) + 1

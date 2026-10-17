@@ -29,7 +29,7 @@ def _cell(repo: dict, check: str) -> str:
         return "未実施"
     covs = c.get("coverage", {})
     if not covs:
-        return STATUS_JA[c["status"]]
+        return "**失敗**" if c["status"] == ERROR else "不明（範囲を判定できない）"
     parts = []
     for area, item in covs.items():
         label = area.split(".", 1)[1] if "." in area else ""

@@ -110,6 +110,8 @@ class Finding:
     # 解消判定に要る検証トークン。今回の実行でこれが全部「検査成功」と確認されたときだけ、
     # 検出が消えた Issue を閉じてよい（CheckResult.verified_scopes と照合する）
     verify: list[str] = field(default_factory=list)
+    # 細かい単位（勧告 1 件など）の抑制で、中身がすべて抑制中になった Finding。Issue は作らず、既存なら抑制ラベルを付ける
+    suppressed: bool = False
 
     def fingerprint(self) -> str:
         # タイトル（リポジトリ名を含む）は入れない。リネームだけで「内容が変わった」と通知しないため
@@ -137,6 +139,7 @@ class Finding:
             "material": self.material,
             "issue": self.issue,
             "verify": self.verify,
+            "suppressed": self.suppressed,
             "fingerprint": self.fingerprint(),
         }
 

@@ -222,7 +222,10 @@ class IssueSyncTests(unittest.TestCase):
         self.assertIsNone(r.by_key("eol:102:qt:6.9"))  # 抑制中は作らない
         self.assertTrue(any(o["what"] == "suppressed_not_created" for o in rep["issues"]["observations"]))
         npm_prod = next((f for f in rep["findings"] if f["key"] == "vuln:101:npm:prod"), None)
-        self.assertIsNone(npm_prod)  # 唯一の勧告が別 ID（CVE）で誤検知登録 → 束ねた Issue も無い
+        # 唯一の勧告が別 ID（CVE）で誤検知登録 → 束は「すべて抑制中」になり Issue は作らない
+        self.assertTrue(npm_prod["suppressed"])
+        self.assertFalse(npm_prod["issue"])
+        self.assertIsNone(r.by_key("vuln:101:npm:prod"))
         r.run(advance_hours=24 * 4)
         r.run(checks="all")  # 期限切れ後の月次検査で作成される
         self.assertIsNotNone(r.by_key("eol:102:qt:6.9"))

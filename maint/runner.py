@@ -90,7 +90,12 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
         notes.append("中央リポジトリが未作成" + ("（dry-run: 作成後に行う予定の Issue 操作を表示）" if opts.dry_run else ""))
     elif central == "none":
         notes.append("GITHUB_TOKEN が無いため中央リポジトリに接続していない")
-    st = state_mod.decode(dashboard.get("body") if dashboard else None) or state_mod.empty()
+    st = state_mod.decode(dashboard.get("body") if dashboard else None)
+    if st is None:
+        if dashboard is not None:
+            notes.append(f"ダッシュボード #{dashboard['number']} の状態ブロックを読めない（壊れている）。台帳を初期化し、全リポジトリを新規として棚卸しする")
+            reasons.append("状態ブロックを読めず初期化した")
+        st = state_mod.empty()
     if dashboard is not None and dashboard.get("state") != "open":
         notes.append(f"ダッシュボード #{dashboard['number']} が閉じられていたため、状態を引き継いで新しく作る")
         dashboard = None
@@ -200,13 +205,15 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
             notes.append("点検完了を記録: " + ", ".join(sorted(set(recorded))))
         manual = manual_finding(ctx, due_items(ctx, st, repo_infos))
 
-    # 周期の完了記録（発見に失敗した回は記録しない＝次回また実行される）
     statuses = [r.get("status", ERROR) if not r.get("error") else ERROR for r in repo_reports]
     if disc.status != ERROR and not opts.only:
-        for p in periods:
-            if p not in failed_periods:
-                st.setdefault("last_completed", {})[p] = now_iso
         apply_to_state(disc, st, now_iso)
+        for rr in repo_reports:  # 棚卸し結果（初回分は残し、最新分は毎回更新）
+            e = st["repos"].get(str(rr["id"]))
+            if e is not None and rr.get("inventory"):
+                compact = _compact_inventory(rr["inventory"])
+                e.setdefault("initial_inventory", {**compact, "at": now_iso[:10]})
+                e["inventory"] = compact
 
     # Issue 同期
     sync_res = SyncResult()
@@ -235,6 +242,15 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
         sync_res.errors.append(f"Issue 同期の途中で失敗: {e.kind} ({e.status})。次回の実行で同じキーから再開する")
     if manual:
         findings.append(manual)
+
+    # 周期の完了記録（発見・Issue 同期に失敗した回、ERROR の検査を含む周期は記録しない＝翌日また実行される）
+    if disc.status != ERROR and not opts.only:
+        for p in periods:
+            if p in failed_periods:
+                continue
+            if sync_res.errors and p != "daily":
+                continue
+            st.setdefault("last_completed", {})[p] = now_iso
 
     if disc.status == ERROR:
         reasons.append("リポジトリ一覧の取得に失敗")
@@ -307,11 +323,24 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
     return report
 
 
+def _compact_inventory(inv: dict) -> dict:
+    return {
+        "has_source": inv.get("has_source"),
+        "empty": inv.get("empty"),
+        "build_systems": inv.get("build_systems", []),
+        "manifests": sorted({f"{m['kind']}:{m['path']}" for m in inv.get("manifests", [])})[:30],
+        "submodules": [s["path"] for s in inv.get("submodules", [])][:10],
+        "workflows": len(inv.get("workflows", [])),
+        "languages": inv.get("languages", [])[:3],
+    }
+
+
 def _health(repo, check: str, n: int, run_url: str | None) -> Finding:
+    # 題名・material に回数を入れない（毎回の更新を避ける）。回数は本文の概要にだけ書く
     return Finding(
         key=f"health:{repo.id}:{check}", kind="health", repo_id=repo.id, repo_name=repo.name,
-        title=f"[監視] {repo.name}: {check} の検査が {n} 回連続で失敗", severity=MEDIUM,
-        summary="同じ検査が連続して失敗しており、この範囲は監視できていない", evidence=[run_url or ""],
+        title=f"[監視] {repo.name}: {check} の検査が連続で失敗", severity=MEDIUM,
+        summary=f"同じ検査が {n} 回以上連続して失敗しており、この範囲は監視できていない", evidence=[run_url or ""],
         recommendation="実行ログのエラーを確認する（レート制限・API 障害・権限不足・形式変更）",
         unverified=["この範囲の問題の有無"], scope=[f"{repo.full_name} の {check} 検査"],
         material={"check": check}, verify=[f"health:{repo.id}:{check}"])

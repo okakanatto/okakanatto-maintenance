@@ -22,9 +22,10 @@ NODE_VER = re.compile(r"node-version:\s*['\"]?([\w.*/-]+)")
 PY_VER = re.compile(r"python-version:\s*['\"]?([\d.]+)")
 
 
-def detect_versions(ctx: Context, inv: Inventory) -> dict[str, list[tuple[str, str]]]:
-    """製品 → [(版, 根拠)]"""
+def detect_versions(ctx: Context, inv: Inventory, read_errors: list[str] | None = None) -> dict[str, list[tuple[str, str]]]:
+    """製品 → [(版, 根拠)]。読めなかったファイルは read_errors に積む（その回は判定を確定させない）。"""
     found: dict[str, list[tuple[str, str]]] = {}
+    errs = read_errors if read_errors is not None else []
 
     def add(product: str, version: str, source: str):
         if version and re.match(r"^\d", version):
@@ -35,7 +36,8 @@ def detect_versions(ctx: Context, inv: Inventory) -> dict[str, list[tuple[str, s
     def text(path: str) -> str:
         try:
             return read_blob(ctx.reader, inv, path).decode("utf-8", "replace")
-        except HttpError:
+        except HttpError as e:
+            errs.append(f"{path}（{e.kind}）")
             return ""
 
     for wf in inv.workflows:
@@ -55,7 +57,8 @@ def detect_versions(ctx: Context, inv: Inventory) -> dict[str, list[tuple[str, s
         if m.kind == "npm-lock":
             try:
                 pkgs, _ = PARSERS["npm-lock"](read_blob(ctx.reader, inv, m.path), m.path)
-            except (HttpError, ParseError):
+            except (HttpError, ParseError) as e:
+                errs.append(f"{m.path}（{type(e).__name__}）")
                 continue
             for p in pkgs:
                 if p.name in npm_map and p.direct:
@@ -64,7 +67,8 @@ def detect_versions(ctx: Context, inv: Inventory) -> dict[str, list[tuple[str, s
             try:
                 d = json.loads(read_blob(ctx.reader, inv, m.path).decode("utf-8-sig"))
                 eng = ((d.get("engines") or {}).get("node")) if isinstance(d, dict) else None
-            except (HttpError, ValueError):
+            except (HttpError, ValueError) as e:
+                errs.append(f"{m.path}（{type(e).__name__}）")
                 eng = None
             if isinstance(eng, str):
                 mm = re.search(r"(\d+)", eng)
@@ -74,8 +78,11 @@ def detect_versions(ctx: Context, inv: Inventory) -> dict[str, list[tuple[str, s
         try:
             raw = read_blob(ctx.reader, inv, path)
             d = json.loads(raw.decode("utf-8-sig"))
-        except (HttpError, ValueError):
+        except HttpError as e:
+            errs.append(f"{path}（{e.kind}）")
             continue
+        except ValueError:
+            continue  # JSON でない *lock*.json は対象外
         if isinstance(d, dict) and isinstance(d.get("qt"), dict) and isinstance(d["qt"].get("version"), str):
             add("qt", d["qt"]["version"], f"{path}（qt.version）")
         for p in vcpkg_list_from_json(raw) or []:
@@ -90,9 +97,13 @@ def check_eol(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
         r.cover("eol", NOT_APPLICABLE if inv.empty else UNKNOWN,
                 "コード未登録" if inv.empty else "ソース非公開のため使用ランタイムの版が分からない（定期点検で確認）")
         return r
-    found = detect_versions(ctx, inv)
+    read_errors: list[str] = []
+    found = detect_versions(ctx, inv, read_errors)
+    if read_errors:
+        r.fail("版の記載を読めないファイル: " + ", ".join(read_errors[:5]))
     warn_days = int(ctx.policy("eol", "warn_days", 90, repo.id, repo.name))
     checked, failed = [], []
+    by_cycle: dict[tuple[str, str], dict] = {}  # 同じ製品・サイクルを複数ファイルで使っていても 1 件にまとめる
     for product, versions in sorted(found.items()):
         try:
             rels = product_releases(ctx, product)
@@ -104,7 +115,8 @@ def check_eol(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
             r.notes.append(f"{product}: endoflife.date に製品がない")
             continue
         checked.append(product)
-        r.verified_scopes.append(f"eol:{repo.id}:{product}")
+        if not read_errors:
+            r.verified_scopes.append(f"eol:{repo.id}:{product}")
         for version, source in versions:
             cyc = match_cycle(rels, version)
             row = {"product": product, "version": version, "source": source}
@@ -123,20 +135,23 @@ def check_eol(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
             else:
                 continue
             newest = next((x for x in rels if not x.get("isEol")), None)
-            rec = f"サポート中のサイクル（例: {newest.get('name')}）への移行を計画する" if newest else "後継版への移行を計画する"
-            r.findings.append(Finding(
-                key=f"eol:{repo.id}:{product}:{cyc.get('name')}",
-                kind="eol", repo_id=repo.id, repo_name=repo.name,
-                title=f"[EOL] {repo.name}: {product} {cyc.get('name')} が{state.split('（')[0]}",
-                severity=sev,
-                summary=f"{source} で {product} {version} を使用。{state}",
-                evidence=[f"https://endoflife.date/{product}"],
-                recommendation=rec,
-                unverified=["配布中のバイナリが同じ版でビルドされたか", "サポート終了後に公開された脆弱性の影響有無"],
-                scope=[f"{source}"],
-                material={"product": product, "cycle": cyc.get("name"), "state": "eol" if sev == MEDIUM else "soon"},
-                verify=[f"eol:{repo.id}:{product}"],
-            ))
+            e = by_cycle.setdefault((product, str(cyc.get("name"))), {"sev": sev, "state": state, "uses": [], "newest": newest})
+            e["uses"].append(f"{source}: {version}")
+    for (product, cycle), e in sorted(by_cycle.items()):
+        rec = f"サポート中のサイクル（例: {e['newest'].get('name')}）への移行を計画する" if e["newest"] else "後継版への移行を計画する"
+        r.findings.append(Finding(
+            key=f"eol:{repo.id}:{product}:{cycle}",
+            kind="eol", repo_id=repo.id, repo_name=repo.name,
+            title=f"[EOL] {repo.name}: {product} {cycle} が{e['state'].split('（')[0]}",
+            severity=e["sev"],
+            summary=f"{product} {cycle} を使用（{'; '.join(e['uses'][:5])}）。{e['state']}",
+            evidence=[f"https://endoflife.date/{product}"],
+            recommendation=rec,
+            unverified=["配布中のバイナリが同じ版でビルドされたか", "サポート終了後に公開された脆弱性の影響有無"],
+            scope=e["uses"][:5],
+            material={"product": product, "cycle": cycle, "state": "eol" if e["sev"] == MEDIUM else "soon"},
+            verify=[f"eol:{repo.id}:{product}"],
+        ))
     for product in ("nodejs",):
         if product not in found and any(m.ecosystem == "npm" for m in inv.manifests):
             r.notes.append("Node.js の版がリポジトリに書かれていない（ビルドに使う Node の EOL は判定できない）")

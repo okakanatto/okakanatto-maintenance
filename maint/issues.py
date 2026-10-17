@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from .config import Config
 from .github import IssueWriter
 from .http import HttpError
-from .model import DUE_DAYS, SEVERITY_JA, Finding
+from .model import DUE_DAYS, SEVERITY_JA, SEVERITY_RANK, Finding
 from .checks.manual import checked_items
 
 AUTO = "maint:auto"
@@ -70,8 +70,9 @@ class SyncResult:
 # --- 本文の描画 ----------------------------------------------------------
 
 _MENTION = re.compile(r"@(?=[A-Za-z0-9-])")
-_REF = re.compile(r"(?<![\w/])#(?=\d)")
-_GH_ISSUE_URL = re.compile(r"https://github\.com/[^\s)]+/(issues|pull|discussions)/\d+[^\s)]*")
+_REF = re.compile(r"#(?=\d)")  # #12・owner/repo#12 の両方
+_GH_REF = re.compile(r"\bGH-(?=\d)", re.I)
+_GH_ISSUE_URL = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[^\s)`]+/(?:issues|pull|discussions)/\d+[^\s)`]*", re.I)
 SAFE_LINK_HOSTS = ("https://osv.dev/", "https://nvd.nist.gov/", "https://github.com/advisories/", "https://rustsec.org/",
                    "https://endoflife.date/", "https://docs.github.com/", "https://www.npmjs.com/", "https://crates.io/",
                    "https://pypi.org/", "https://learn.microsoft.com/", "https://www.cve.org/")
@@ -79,9 +80,10 @@ SAFE_LINK_HOSTS = ("https://osv.dev/", "https://nvd.nist.gov/", "https://github.
 
 def neutralize(text: str) -> str:
     """外部由来の文字列から @メンションと #番号・Issue URL の自動リンク（相手側への通知・相互参照）を消す。"""
-    text = _MENTION.sub("@\u200b", str(text))
+    text = _GH_ISSUE_URL.sub(lambda m: "`" + m.group(0) + "`", str(text))
+    text = _MENTION.sub("@\u200b", text)
     text = _REF.sub("#\u200b", text)
-    text = _GH_ISSUE_URL.sub(lambda m: "`" + m.group(0).replace("`", "") + "`", text)
+    text = _GH_REF.sub(lambda m: m.group(0)[:2] + "\u200b-", text)
     return text
 
 
@@ -208,11 +210,45 @@ def ensure_labels(writer: IssueWriter, res: SyncResult) -> None:
             res.act("create_label", name)
 
 
+def merge_findings(findings: list[Finding]) -> list[Finding]:
+    """同じキーの Finding を 1 件にまとめる（同じ製品を複数ファイルで使う等）。重要度は高い方、根拠・範囲は和集合。"""
+    out: dict[str, Finding] = {}
+    for f in findings:
+        g = out.get(f.key)
+        if g is None:
+            out[f.key] = f
+            continue
+        if SEVERITY_RANK[f.severity] > SEVERITY_RANK[g.severity]:
+            g.severity, g.title, g.summary = f.severity, f.title, f.summary
+        g.evidence = list(dict.fromkeys(g.evidence + f.evidence))
+        g.scope = list(dict.fromkeys(g.scope + f.scope))
+        g.unverified = list(dict.fromkeys(g.unverified + f.unverified))
+        g.aliases = sorted(set(g.aliases) | set(f.aliases))
+        g.verify = sorted(set(g.verify) | set(f.verify))
+        g.issue = g.issue or f.issue
+        g.suppressed = g.suppressed and f.suppressed
+        if f.material != g.material:
+            g.material = {**g.material, "merged": sorted({json.dumps(g.material, sort_keys=True, ensure_ascii=False), json.dumps(f.material, sort_keys=True, ensure_ascii=False)} | set(g.material.get("merged", [])))}
+    return list(out.values())
+
+
+def _escalated(old: dict, f: Finding) -> list[str]:
+    """人が閉じた Issue に知らせるべき悪化（重要度の上昇・新しい勧告）。"""
+    out = []
+    if old.get("sev") in SEVERITY_RANK and SEVERITY_RANK[f.severity] > SEVERITY_RANK[old["sev"]]:
+        out.append(f"重要度 {SEVERITY_JA[old['sev']]} → {SEVERITY_JA[f.severity]}")
+    new_ids = sorted(set(f.material.get("advisories", [])) - set((old.get("material") or {}).get("advisories", [])))
+    if new_ids:
+        out.append("新しい勧告: " + ", ".join(new_ids[:10]) + (" ほか" if len(new_ids) > 10 else ""))
+    return out
+
+
 def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Finding], verified: set[str],
          now: dt.datetime, run_url: str | None, refresh_days: int = 7) -> SyncResult:
     res = SyncResult()
     today = now.date()
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    findings = merge_findings(findings)
     managed = [i for i in issues if DASHBOARD not in _label_names(i)]
     by_key, dups = index_issues(managed)
     for d in dups:
@@ -237,19 +273,25 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
                     iss, key = by_key[k2], k2
                     break
         sup = cfg.suppression_for(f.key, f.aliases) or (cfg.suppression_for(key) if key != f.key else None)
-        active = bool(sup and sup.active(today))
+        active = bool(sup and sup.active(today)) or f.suppressed
+        # 今回の検査が範囲を最後まで確かめられていない Finding は、内容の変化として扱わない（一時的な失敗で通知が往復しないように）
+        complete = all(_is_verified(t, verified) for t in f.verify) if f.verify else True
         if iss is None:
             if not f.issue:
                 continue
             if active:
-                res.observe("suppressed_not_created", f.key, status=sup.status, until=str(sup.until))
+                res.observe("suppressed_not_created", f.key, status=sup.status if sup else "advisory", until=str(sup.until) if sup else "")
                 continue
             meta = {"key": f.key, "fp": f.fingerprint(), "sev": f.severity, "verify": f.verify, "aliases": f.aliases,
                     "first_seen": now_iso, "last_refreshed": now_iso, "material": f.material}
-            created = writer.create_issue(neutralize(f.title), render_body(f, meta, run_url), labels_for(f, False))
+            body = render_body(f, meta, run_url)
+            created = writer.create_issue(neutralize(f.title), body, labels_for(f, False))
             num = (created or {}).get("number")
             res.act("create", f.key, num, title=f.title, severity=f.severity)
             res.issue_numbers[f.key] = num
+            by_key[f.key] = {"number": num, "state": "open", "title": neutralize(f.title), "body": body,
+                             "labels": [{"name": x} for x in labels_for(f, False)]}
+            matched.add(f.key)
             continue
         matched.add(key)
         num = iss["number"]
@@ -260,6 +302,10 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
         meta = {**old, "key": key, "fp": f.fingerprint(), "sev": f.severity, "verify": f.verify,
                 "aliases": sorted(set(old.get("aliases", [])) | set(f.aliases)), "material": f.material,
                 "first_seen": old.get("first_seen") or now_iso}
+        if not complete:
+            if fp_changed:
+                res.observe("unverified_change_skipped", key, num, note="範囲の検査が一部失敗したため、内容の変化として扱わない")
+            continue
         if iss.get("state") != "open":
             if RESOLVED in labels and not active:
                 meta["last_refreshed"] = now_iso
@@ -267,6 +313,15 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
                 writer.update_issue(num, state="open", title=neutralize(f.title), body=render_body(f, meta, run_url), labels=new_labels)
                 writer.comment(num, "再検出しました。前回は検証済みで閉じましたが、今回の検査で再び見つかりました。\n\n" + _change_summary(old, f))
                 res.act("reopen", key, num, title=f.title)
+                continue
+            worse = _escalated(old, f) if fp_changed and not active else []
+            if worse:
+                # 人が閉じた束にも、悪化は 1 回だけ知らせる（再オープンはしない。meta を更新して二度目を出さない）
+                meta["last_refreshed"] = now_iso
+                writer.update_issue(num, body=render_body(f, meta, run_url))
+                writer.comment(num, "閉じられた Issue ですが、新しい検出がありました（再オープンはしません。対応しないなら suppressions.json に期限付きで記録してください）。\n\n"
+                               + "\n".join(f"- {neutralize(w)}" for w in worse))
+                res.act("notify_closed", key, num)
             else:
                 res.observe("closed_still_detected", key, num, note="人が閉じた Issue。再オープンしない（期限付き再評価は suppressions.json で）")
             continue
@@ -292,8 +347,6 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
     for key, iss in by_key.items():
         if key in matched or iss.get("state") != "open" or key.startswith("manual:"):
             continue
-        if any(f.key == key for f in findings):
-            continue
         meta = parse_meta(iss.get("body"))
         tokens = meta.get("verify") or []
         missing_tokens = [t for t in tokens if not _is_verified(t, verified)]
@@ -314,6 +367,7 @@ def sync_manual(writer: IssueWriter, issues: list[dict], finding: Finding | None
         return
     by_key, _ = index_issues(manual)
     if finding.key in by_key:
+        res.issue_numbers[finding.key] = by_key[finding.key]["number"]
         return  # 今月分は作成済み
     carried = []
     for key, iss in by_key.items():
@@ -330,6 +384,7 @@ def sync_manual(writer: IssueWriter, issues: list[dict], finding: Finding | None
         body = f"前月から持ち越しあり（旧 Issue 番号: {', '.join(map(str, carried))}）\n\n" + body
     created = writer.create_issue(neutralize(finding.title), body, labels_for(finding, False))
     res.act("create", finding.key, (created or {}).get("number"), title=finding.title, severity=finding.severity)
+    res.issue_numbers[finding.key] = (created or {}).get("number")
 
 
 def _older_than(iso: str | None, now: dt.datetime, days: int) -> bool:
