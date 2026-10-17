@@ -1,0 +1,131 @@
+{
+  "owner": "okakanatto",
+  "central_repo": "okakanatto-maintenance",
+  "exclude": {
+    "names": [],
+    "ids": []
+  },
+  "repo_policies": {},
+  "issue_policy": {
+    "vuln_min_severity": "low",
+    "dev_only_downgrade": true,
+    "refresh_days": 7,
+    "health_failures_for_issue": 3,
+    "manual_check_due_days": 14
+  },
+  "update_policy": {
+    "major_lag_issue": 2,
+    "crates_delay_sec": 0.2
+  },
+  "ci_policy": {
+    "stale_days": 90,
+    "deprecated_runtimes": {
+      "node12": "削除済み（実行できない）",
+      "node16": "2024-11-12 に削除済み",
+      "node20": "2026-09-23 に削除予定と告知（node24 で強制実行され互換性は保証されない）"
+    },
+    "retired_runners": {
+      "ubuntu-20.04": "2025-04-15",
+      "windows-2019": "2025-06-30",
+      "macos-12": "2024-12-03",
+      "macos-13": "2025-12-04",
+      "macos-14": "2026-11-02"
+    }
+  },
+  "eol": {
+    "warn_days": 90
+  },
+  "manual_checks": [
+    {
+      "id": "monitor-alive",
+      "title": "監視そのものの稼働確認（ダッシュボードの最終実行日時・Actions の有効状態）",
+      "interval_days": 28,
+      "applies_to": {
+        "global": true
+      },
+      "how": "ダッシュボード Issue の最終実行が 2 日以内か、Actions 画面で maintenance ワークフローが有効かを見る。README「監視停止」参照",
+      "sources": [
+        "https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows"
+      ]
+    },
+    {
+      "id": "webview2",
+      "title": "WebView2 Runtime のサポート・互換性情報",
+      "interval_days": 90,
+      "applies_to": {
+        "build_systems": [
+          "Tauri"
+        ],
+        "readme_contains": [
+          "WebView2"
+        ]
+      },
+      "how": "WebView2 のリリースノートと Evergreen のサポート対象 OS を確認し、対象アプリの動作環境の記載と矛盾しないか見る",
+      "sources": [
+        "https://learn.microsoft.com/microsoft-edge/webview2/release-notes/"
+      ]
+    },
+    {
+      "id": "tauri",
+      "title": "Tauri のセキュリティ勧告・メジャー版のサポート状況",
+      "interval_days": 30,
+      "applies_to": {
+        "build_systems": [
+          "Tauri"
+        ]
+      },
+      "how": "Tauri のセキュリティ勧告とリリース告知を確認する（crate の既知脆弱性は毎日 OSV で照合済み。ここではサポート方針と WebView 側を見る）",
+      "sources": [
+        "https://github.com/tauri-apps/tauri/security/advisories",
+        "https://v2.tauri.app/release/"
+      ]
+    },
+    {
+      "id": "windows-target",
+      "title": "動作環境に書いた Windows のサポート期限",
+      "interval_days": 90,
+      "applies_to": {
+        "readme_contains": [
+          "Windows 10",
+          "Windows 11",
+          "Windows用",
+          "Windows 用"
+        ]
+      },
+      "how": "README の動作環境に書いた Windows のサポート期限を確認する（Windows 10 は 2025-10-14 にサポート終了済み）",
+      "sources": [
+        "https://endoflife.date/windows"
+      ]
+    },
+    {
+      "id": "native-deps",
+      "title": "C/C++・vcpkg・Qt 等の同梱ライブラリの既知脆弱性（自動照合できない範囲）",
+      "interval_days": 30,
+      "applies_to": {
+        "coverage_gap": [
+          "vuln.native-packages",
+          "vuln.native"
+        ]
+      },
+      "how": "ダッシュボードの vcpkg 一覧（レポート JSON の native_packages）と同梱ライブラリを、各上流のセキュリティ情報・NVD で確認する",
+      "sources": [
+        "https://nvd.nist.gov/vuln/search",
+        "https://www.qt.io/product/security"
+      ]
+    },
+    {
+      "id": "binary-only",
+      "title": "ソース非公開の配布物に含まれる依存の確認",
+      "interval_days": 30,
+      "applies_to": {
+        "coverage_gap": [
+          "vuln.source"
+        ]
+      },
+      "how": "手元（または非公開リポジトリ）のロックファイルで脆弱性を確認する。中央監視は配布物の中身を見られない",
+      "sources": [
+        "https://osv.dev/"
+      ]
+    }
+  ]
+}

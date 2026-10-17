@@ -1,0 +1,4 @@
+{
+  "_説明": "誤検知・保留・リスク受容の記録。key は Issue 本文の maint-key。status は false_positive / snoozed / risk_accepted。snoozed と risk_accepted は until（再評価日 YYYY-MM-DD）必須。書式は README「誤検知の抑制」",
+  "suppressions": []
+}
