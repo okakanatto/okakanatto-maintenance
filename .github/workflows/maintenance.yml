@@ -1,0 +1,75 @@
+# 中央保守監視。毎日 1 回起動し、週次・月次の検査は期日が来た日に自動で含める（取りこぼした日は翌日に回る）。
+# 監視対象のリポジトリには書き込まない。書き込むのはこのリポジトリの Issue だけ。
+name: maintenance
+
+on:
+  schedule:
+    - cron: "17 21 * * *" # 毎日 06:17 JST（毎時 0 分は遅延しやすいので避ける）
+  workflow_dispatch:
+    inputs:
+      checks:
+        description: "実行する周期（auto = 期日が来たものだけ）"
+        type: choice
+        options: [auto, daily, weekly, monthly, all]
+        default: auto
+      dry_run:
+        description: "Issue に書き込まない（予定の操作だけ表示）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+# 二重実行を防ぐ（手動実行と定期実行が重なっても順番に処理する）
+concurrency:
+  group: maintenance
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 自己テスト（失敗したら監視も Issue 操作もしない）
+        run: python3 -m unittest discover -s tests -t . -q
+
+      - name: 監視
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MAINT_READ_TOKEN: ${{ secrets.MAINT_READ_TOKEN }}
+          DEPENDABOT_ALERTS_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+          CHECKS: ${{ inputs.checks || 'auto' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: |
+          set -eu
+          args="--checks $CHECKS --report-dir out"
+          if [ -n "$DRY_RUN" ]; then args="$args --dry-run"; fi
+          python3 -m maint run $args
+
+      - name: レポートを保存（report.json / report.md）
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: maintenance-report
+          path: out/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: 外部の死活監視へ通知（任意。HEALTHCHECK_PING_URL を設定したときだけ）
+        if: always()
+        env:
+          PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ -z "${PING_URL}" ]; then
+            echo "HEALTHCHECK_PING_URL 未設定: 外部の死活監視なし（README「監視停止」）"
+            exit 0
+          fi
+          suffix=""
+          if [ "${JOB_STATUS}" != "success" ]; then suffix="/fail"; fi
+          curl -fsS -m 10 --retry 3 "${PING_URL}${suffix}" > /dev/null || echo "死活監視への通知に失敗（監視結果には影響しない）"
