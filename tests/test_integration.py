@@ -259,6 +259,60 @@ class IssueSyncTests(unittest.TestCase):
         r.run()
         self.assertEqual(r.by_key("health:101:release")["state"], "closed")
 
+    def test_inventory_failures_open_health_issue(self):
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run()
+        w.fault("/repos/okakanatto/NativeApp/git/trees/", *[resp(500, {})] * 60)
+        for _ in range(3):
+            r.run()
+        self.assertIsNotNone(r.by_key("health:102:inventory"))
+        w.faults.clear()
+        r.run()
+        self.assertEqual(r.by_key("health:102:inventory")["state"], "closed")
+
+    def test_failed_weekly_is_retried_next_day(self):
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run(checks="all")
+        r.now = r.now.replace(day=26)  # 1 週間以上あと
+        w.fault("/repos/okakanatto/AppA/git/trees/", *[resp(500, {})] * 3)
+        rep = r.run(checks="auto")
+        self.assertIn("weekly", rep["run"]["periods"])
+        w.faults.clear()
+        rep2 = r.run(checks="auto")
+        self.assertIn("weekly", rep2["run"]["periods"])  # 失敗した週次は翌日に再実行
+        rep3 = r.run(checks="auto")
+        self.assertNotIn("weekly", rep3["run"]["periods"])
+
+    def test_closed_dashboard_state_is_inherited(self):
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run()
+        dash = next(i for i in w.issues if "maint:dashboard" in {lb["name"] for lb in i["labels"]})
+        dash["state"] = "closed"
+        rep = r.run()
+        self.assertEqual(rep["discovery"]["new"], [])  # 台帳を引き継いだので全部「新規」にならない
+        dashes = [i for i in w.issues if "maint:dashboard" in {lb["name"] for lb in i["labels"]} and i["state"] == "open"]
+        self.assertEqual(len(dashes), 1)
+
+    def test_titles_are_neutralized(self):
+        from maint.issues import sync
+        from maint.model import Finding
+
+        w = W.build_world()
+        r = W.Runner(w)
+        http = W.HttpClient(transport=w, sleep=lambda s: None)
+        writer = W.IssueWriter(http, "t", W.CENTRAL)
+        f = Finding(key="deps-deprecated:101:npm:@evil/pkg", kind="deps", repo_id=101, repo_name="AppA",
+                    title="[依存] AppA: @evil/pkg 1.0 が非推奨", severity="medium", summary="x")
+        sync(writer, r.cfg, [], [f], set(), r.now, None)
+        self.assertNotIn("@evil", w.issues[0]["title"])
+        w.log.clear()
+        issues = writer.list_issues("maint:auto")
+        sync(writer, r.cfg, issues, [f], set(), r.now, None)
+        self.assertEqual(w.writes(), [])  # 無害化した題名どうしの比較で「題名変更」と誤判定しない
+
     def test_listing_failure_does_nothing(self):
         w = W.build_world()
         r = W.Runner(w)

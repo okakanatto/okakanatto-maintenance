@@ -246,7 +246,7 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
                 continue
             meta = {"key": f.key, "fp": f.fingerprint(), "sev": f.severity, "verify": f.verify, "aliases": f.aliases,
                     "first_seen": now_iso, "last_refreshed": now_iso, "material": f.material}
-            created = writer.create_issue(f.title, render_body(f, meta, run_url), labels_for(f, False))
+            created = writer.create_issue(neutralize(f.title), render_body(f, meta, run_url), labels_for(f, False))
             num = (created or {}).get("number")
             res.act("create", f.key, num, title=f.title, severity=f.severity)
             res.issue_numbers[f.key] = num
@@ -264,7 +264,7 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
             if RESOLVED in labels and not active:
                 meta["last_refreshed"] = now_iso
                 new_labels = sorted((labels - {RESOLVED, SUPPRESSED}) | set(labels_for(f, False)))
-                writer.update_issue(num, state="open", title=f.title, body=render_body(f, meta, run_url), labels=new_labels)
+                writer.update_issue(num, state="open", title=neutralize(f.title), body=render_body(f, meta, run_url), labels=new_labels)
                 writer.comment(num, "再検出しました。前回は検証済みで閉じましたが、今回の検査で再び見つかりました。\n\n" + _change_summary(old, f))
                 res.act("reopen", key, num, title=f.title)
             else:
@@ -275,10 +275,10 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
         missing = want_labels - labels
         label_change = bool(stale or missing)
         refresh_due = _older_than(old.get("last_refreshed"), now, refresh_days)
-        title_change = iss.get("title") != f.title
+        title_change = iss.get("title") != neutralize(f.title)
         if fp_changed or refresh_due or label_change or title_change:
             meta["last_refreshed"] = now_iso
-            writer.update_issue(num, title=f.title, body=render_body(f, meta, run_url), labels=sorted((labels - stale) | want_labels))
+            writer.update_issue(num, title=neutralize(f.title), body=render_body(f, meta, run_url), labels=sorted((labels - stale) | want_labels))
             res.act("update", key, num, reason=",".join(x for x, c in (("内容", fp_changed), ("定期更新", refresh_due), ("ラベル", label_change), ("題名", title_change)) if c))
         if SUPPRESSED in labels and not active:
             when = f"（期限 {sup.until}）" if sup and sup.until else ""
@@ -328,7 +328,7 @@ def sync_manual(writer: IssueWriter, issues: list[dict], finding: Finding | None
     body = render_body(finding, meta, run_url)
     if carried:
         body = f"前月から持ち越しあり（旧 Issue 番号: {', '.join(map(str, carried))}）\n\n" + body
-    created = writer.create_issue(finding.title, body, labels_for(finding, False))
+    created = writer.create_issue(neutralize(finding.title), body, labels_for(finding, False))
     res.act("create", finding.key, (created or {}).get("number"), title=finding.title, severity=finding.severity)
 
 

@@ -69,7 +69,8 @@ def load_central(writer: IssueWriter | None) -> tuple[list[dict], dict | None, s
         if e.kind == "not_found":
             return [], None, "missing"
         raise
-    dashboards = sorted((i for i in issues if any((lb.get("name") if isinstance(lb, dict) else lb) == DASHBOARD for lb in i.get("labels", [])) and i.get("state") == "open"), key=lambda i: i["number"])
+    dashboards = sorted((i for i in issues if any((lb.get("name") if isinstance(lb, dict) else lb) == DASHBOARD for lb in i.get("labels", []))),
+                        key=lambda i: (i.get("state") == "open", i["number"]), reverse=True)
     return issues, (dashboards[0] if dashboards else None), "ok"
 
 
@@ -90,6 +91,9 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
     elif central == "none":
         notes.append("GITHUB_TOKEN が無いため中央リポジトリに接続していない")
     st = state_mod.decode(dashboard.get("body") if dashboard else None) or state_mod.empty()
+    if dashboard is not None and dashboard.get("state") != "open":
+        notes.append(f"ダッシュボード #{dashboard['number']} が閉じられていたため、状態を引き継いで新しく作る")
+        dashboard = None
     if ctx.dependabot is None:
         notes.append("Dependabot alerts: 読み取りトークン未設定のため全リポジトリで未取得（脆弱性は OSV のみで照合）")
     if dashboard is None and central == "ok":
@@ -105,24 +109,31 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
     repo_reports = []
     repo_infos: dict[str, dict] = {}
     new_ids = {r.id for r in disc.new}
+    health_threshold = int(ctx.cfg.section("issue_policy").get("health_failures_for_issue", 3))
+    failed_periods: set[str] = set()  # ERROR になった検査を含む周期は「完了」にしない（翌日に再実行）
     for repo in disc.active:
         rep = {"id": repo.id, "name": repo.name, "full_name": repo.full_name, "html_url": repo.html_url, "is_new": repo.id in new_ids, "checks": {}}
         repo_reports.append(rep)
         policy = ctx.cfg.repo_policy(repo.id, repo.name)
         # 新規発見したリポジトリは周期に関係なく全検査（初回棚卸し）
         to_run = [c for p in PERIODS for c in PERIOD_CHECKS[p]] if repo.id in new_ids else checks_to_run
+        verified.add(f"lifecycle:{repo.id}")  # 公開一覧に出ている＝消失ではない
         try:
             inv = build_inventory(ctx.reader, repo, repo.default_branch, policy.get("ignore_paths"))
-        except HttpError as e:
-            rep["error"] = f"ツリーを取得できない: {e.kind} ({e.status})"
-            _count_failure(st, repo.id, "inventory", True)
-            continue
-        except Exception as e:  # 想定外でも他リポジトリは続ける
-            rep["error"] = f"棚卸しで想定外のエラー: {type(e).__name__}: {e}"
-            errors.append(f"{repo.name}/inventory: {type(e).__name__}: {e}")
-            tracebacks.append(traceback.format_exc(limit=5))
+        except Exception as e:  # HttpError も想定外の例外も、他リポジトリは続ける
+            if isinstance(e, HttpError):
+                rep["error"] = f"ツリーを取得できない: {e.kind} ({e.status})"
+            else:
+                rep["error"] = f"棚卸しで想定外のエラー: {type(e).__name__}: {e}"
+                errors.append(f"{repo.name}/inventory: {type(e).__name__}: {e}")
+                tracebacks.append(traceback.format_exc(limit=5))
+            n = _count_failure(st, repo.id, "inventory", True)
+            if n >= health_threshold:
+                findings.append(_health(repo, "inventory", n, opts.run_url))
+            failed_periods |= set(periods)
             continue
         _count_failure(st, repo.id, "inventory", False)
+        verified.add(f"health:{repo.id}:inventory")
         rep["inventory"] = inv.summary()
         results: dict[str, CheckResult] = {}
         rel_res, rel_inv = None, None
@@ -155,14 +166,10 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
                 n = _count_failure(st, repo.id, name, cr.status == ERROR)
                 if n == 0:
                     verified.add(f"health:{repo.id}:{name}")
-                elif n >= int(ctx.cfg.section("issue_policy").get("health_failures_for_issue", 3)):
-                    findings.append(Finding(
-                        key=f"health:{repo.id}:{name}", kind="health", repo_id=repo.id, repo_name=repo.name,
-                        title=f"[監視] {repo.name}: {name} の検査が {n} 回連続で失敗", severity=MEDIUM,
-                        summary="同じ検査が連続して失敗しており、この範囲は監視できていない", evidence=[opts.run_url or ""],
-                        recommendation="実行ログのエラーを確認する（レート制限・API 障害・権限不足・形式変更）",
-                        unverified=["この範囲の問題の有無"], scope=[f"{repo.full_name} の {name} 検査"],
-                        material={"check": name}, verify=[f"health:{repo.id}:{name}"]))
+                elif n >= health_threshold:
+                    findings.append(_health(repo, name, n, opts.run_url))
+                if cr.status == ERROR:
+                    failed_periods |= {p for p in periods if name in PERIOD_CHECKS[p]}
         rep["checks"] = {k: v.to_dict() for k, v in results.items()}
         rep["status"] = worst_status([v.status for v in results.values()])
         info = {"build_systems": inv.build_systems, "releases": (rel_res.data or {}).get("releases") if rel_res else None,
@@ -173,7 +180,6 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
             except HttpError:
                 pass
         repo_infos[repo.name] = info
-        verified.add(f"lifecycle:{repo.id}")
 
     # 監視対象から消えたもの
     for m in disc.missing:
@@ -198,7 +204,8 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
     statuses = [r.get("status", ERROR) if not r.get("error") else ERROR for r in repo_reports]
     if disc.status != ERROR and not opts.only:
         for p in periods:
-            st.setdefault("last_completed", {})[p] = now_iso
+            if p not in failed_periods:
+                st.setdefault("last_completed", {})[p] = now_iso
         apply_to_state(disc, st, now_iso)
 
     # Issue 同期
@@ -278,7 +285,12 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
 
     # ダッシュボード（状態の永続化を兼ねる）
     if skipped is None and not opts.only and not (central == "missing" and not opts.dry_run):
-        body = render_markdown(report, dashboard=True) + "\n\n" + state_mod.encode(st)
+        state_block = state_mod.encode(st)
+        md = render_markdown(report, dashboard=True)
+        limit = 64000 - len(state_block)
+        if len(md) > limit:
+            md = md[: max(0, limit - 200)] + "\n\n…（長すぎるため省略。全文は実行記録の report.md）"
+        body = md + "\n\n" + state_block
         try:
             if dashboard:
                 writer.update_issue(dashboard["number"], body=body)
@@ -293,6 +305,16 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
             report["markdown"] = render_markdown(report)
     report["state"] = st
     return report
+
+
+def _health(repo, check: str, n: int, run_url: str | None) -> Finding:
+    return Finding(
+        key=f"health:{repo.id}:{check}", kind="health", repo_id=repo.id, repo_name=repo.name,
+        title=f"[監視] {repo.name}: {check} の検査が {n} 回連続で失敗", severity=MEDIUM,
+        summary="同じ検査が連続して失敗しており、この範囲は監視できていない", evidence=[run_url or ""],
+        recommendation="実行ログのエラーを確認する（レート制限・API 障害・権限不足・形式変更）",
+        unverified=["この範囲の問題の有無"], scope=[f"{repo.full_name} の {check} 検査"],
+        material={"check": check}, verify=[f"health:{repo.id}:{check}"])
 
 
 def _count_failure(st: dict, repo_id: int, check: str, failed: bool) -> int:

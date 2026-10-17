@@ -281,6 +281,9 @@ def _upstream_advisories(ctx: Context, repo: Repo, sm: dict, r: CheckResult) -> 
     return f"上流 {full} の公開勧告 {len(advs)} 件（要確認）"
 
 
+DEPENDABOT_ECO = {"npm": "npm", "rust": "crates.io", "pip": "PyPI", "go": "Go", "nuget": "NuGet", "composer": "Packagist", "maven": "Maven", "rubygems": "RubyGems"}
+
+
 def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vuln], hits) -> None:
     if ctx.dependabot is None:
         return  # 全リポジトリ共通の設定なので、レポート冒頭に 1 回だけ表示する（runner）
@@ -291,6 +294,8 @@ def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vul
             r.cover("vuln.dependabot", UNSUPPORTED, "このリポジトリで Dependabot alerts が無効")
         else:
             r.cover("vuln.dependabot", UNKNOWN, f"取得失敗: {e.kind} ({e.status})")
+            r.fail(f"Dependabot alerts の取得に失敗: {e.kind}（今回は脆弱性 Issue を閉じない）")
+            r.verified_scopes = [t for t in r.verified_scopes if not t.startswith("vuln")]
         return
     known = set(details)
     for v in details.values():
@@ -320,7 +325,8 @@ def _dependabot(ctx: Context, repo: Repo, r: CheckResult, details: dict[str, Vul
             references=[a.get("html_url", "")] if a.get("html_url") else [],
             informational=None,
         )
-        hits[ghsa].append(("default", Package("dependabot:" + str(pkg.get("ecosystem")), str(pkg.get("name")), "?", str(dep.get("manifest_path")))))
+        eco = DEPENDABOT_ECO.get(str(pkg.get("ecosystem")), str(pkg.get("ecosystem")))
+        hits[ghsa].append(("default", Package(eco, str(pkg.get("name")), "?", str(dep.get("manifest_path")), dev=(dep.get("scope") == "development"))))
     r.cover("vuln.dependabot", SUPPORTED, f"open {len(alerts)} 件（OSV に無いもの {extra} 件）")
 
 
