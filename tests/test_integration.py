@@ -116,6 +116,17 @@ class DiscoveryTests(unittest.TestCase):
         rep = r.run()
         self.assertEqual(rep["discovery"]["missing"][0]["state"], "transferred")
 
+    def test_became_private_when_token_can_see_it(self):
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run()
+        n = r.by_key("eol:102:qt:6.9")["number"]
+        w.repos[102].private = True  # 一覧から消え、/repositories/{id} では private=true が読める
+        rep = r.run(checks="all")
+        self.assertEqual(rep["discovery"]["missing"][0]["state"], "private")
+        self.assertEqual(w.issue(n)["state"], "open")
+        self.assertIn("非公開化", rep["markdown"])
+
 
 class IssueSyncTests(unittest.TestCase):
     def test_first_run_creates_then_repeated_runs_are_silent(self):
