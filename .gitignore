@@ -3,3 +3,5 @@ __pycache__/
 out/
 .env
 *.local.json
+# 保守の修正作業で clone するアプリ（AGENTS.md 6 章）
+work/
