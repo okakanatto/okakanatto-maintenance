@@ -232,6 +232,32 @@ class ReviewRegressionTests(unittest.TestCase):
         app = next(x for x in rep["repos"] if x["name"] == "AppA")
         self.assertEqual(app["checks"]["release"]["coverage"]["release"]["level"], "UNKNOWN")
 
+    def test_18_tag_only_or_filtered_workflow_without_runs_is_not_flagged(self):
+        """実運用で見つかった誤検知（csv-diff-review の release.yml、2026-10-18）。"""
+        from maint.checks.ci import parse_workflow
+
+        self.assertTrue(parse_workflow('on:\n  push:\n    tags: ["v*"]\njobs:\n')["push_tags_only"])
+        self.assertFalse(parse_workflow('on:\n  push:\n    branches: [main]\n    tags: ["v*"]\n')["push_tags_only"])
+        self.assertFalse(parse_workflow("on:\n  push:\n    paths: [a]\n")["push_tags_only"])
+        self.assertFalse(parse_workflow("on: push\n")["push_tags_only"])
+        w = W.build_world()
+        release = b'on:\n  push:\n    tags: ["v*"]\njobs:\n  r:\n    runs-on: windows-latest\n    steps:\n      - run: echo\n'
+        bench = b"on:\n  push:\n    branches: [main]\n    paths: [bench.ps1]\njobs:\n  b:\n    runs-on: windows-latest\n    steps:\n      - run: echo\n"
+        checks = b"on:\n  push:\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n"
+        app = w.add_repo(FakeRepo(205, "CsvApp", head=Snapshot("d" * 40, {
+            ".github/workflows/release.yml": release, ".github/workflows/bench.yml": bench,
+            ".github/workflows/checks.yml": checks, "src/main.rs": b"fn main(){}"})))
+        app.workflows = [{"id": 1, "name": "release", "path": ".github/workflows/release.yml", "state": "active"},
+                         {"id": 2, "name": "bench", "path": ".github/workflows/bench.yml", "state": "active"},
+                         {"id": 3, "name": "checks", "path": ".github/workflows/checks.yml", "state": "active"}]
+        app.runs = {3: [{"status": "completed", "conclusion": "success", "head_branch": "main",
+                         "created_at": "2026-10-17T00:00:00Z", "html_url": "x"}]}
+        r = W.Runner(w)
+        r.run()
+        self.assertIsNone(r.by_key("ci-never-run:205:1"))  # タグ push 専用
+        self.assertIsNone(r.by_key("ci-never-run:205:2"))  # 他は動いている（paths 条件が未成立なだけ）
+        self.assertIsNotNone(r.by_key("ci-never-run:102:9001"))  # Actions が一度も動いていないリポジトリは引き続き指摘
+
     def test_state_keeps_initial_inventory(self):
         w = W.build_world()
         r = W.Runner(w)

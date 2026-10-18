@@ -14,3 +14,4 @@
 | IMP-1 | 毎回 PARTIAL の検査は連続失敗に数えず、health Issue にならない | 低 | 🔴 | 未定 | レビュー |
 | IMP-2 | 配布バイナリの来歴（Artifact attestations・アセットの digest）を確認して release の範囲を広げる | 低 | 🔴 | 未定 | レビュー |
 | IMP-3 | yarn.lock・pnpm-lock.yaml・bun.lock の解析器（現状は検出して「未対応」表示） | 低 | 🔴 | 未定 | 実装 |
+| BUG-1 | タグ push 専用・トリガー条件未成立のワークフローを「一度も実行されていない」と誤検知 | 中 | 🟢 | v0.1.1 | 2026-10-18 リポジトリ全体の実行 0 件のときだけ指摘に修正。実データ（csv-diff-review の release.yml） |

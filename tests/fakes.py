@@ -227,6 +227,9 @@ class FakeWorld:
             return resp(200, [{"name": t, "commit": {"sha": s.sha}} for t, s in r.tags.items()])
         if rest == ["languages"]:
             return resp(200, {"Python": 100})
+        if rest == ["actions", "runs"]:
+            allruns = [x for v in r.runs.values() for x in v]
+            return resp(200, {"total_count": len(allruns), "workflow_runs": allruns[: int(q.get("per_page", 30))]})
         if rest == ["actions", "workflows"]:
             return resp(200, {"total_count": len(r.workflows), "workflows": r.workflows})
         if rest[:2] == ["actions", "workflows"] and rest[3:] == ["runs"]:

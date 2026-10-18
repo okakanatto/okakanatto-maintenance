@@ -128,6 +128,11 @@ class GitHubReader(GitHubBase):
             params["branch"] = branch
         return self.get(f"repos/{full_name}/actions/workflows/{workflow_id}/runs", params)
 
+    def repo_runs_total(self, full_name: str) -> int:
+        """リポジトリ全体の Actions 実行回数（0 なら Actions が無効か、一度も動いていない）。"""
+        d = self.get(f"repos/{full_name}/actions/runs", {"per_page": 1})
+        return int((d or {}).get("total_count") or 0)
+
     def latest_release(self, full_name: str) -> dict | None:
         try:
             return self.get(f"repos/{full_name}/releases/latest")

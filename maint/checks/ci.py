@@ -63,7 +63,29 @@ def parse_workflow(text: str) -> dict:
                 mm = re.match(r"^\s{1,4}([a-z_]+):", line)
                 if mm and mm.group(1) in TRIGGER_KEYS:
                     triggers.add(mm.group(1))
-    return {"uses": uses, "runners": sorted(set(runners)), "dynamic_runner": dynamic, "triggers": sorted(triggers)}
+    return {"uses": uses, "runners": sorted(set(runners)), "dynamic_runner": dynamic, "triggers": sorted(triggers),
+            "push_tags_only": _push_tags_only(text)}
+
+
+def _push_tags_only(text: str) -> bool:
+    """push トリガーがタグだけに絞られているか（例: push: tags: ["v*"]）。タグを付けるまでは実行 0 件が正常。"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^([ \t]+)push:[ \t]*(#.*)?$", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        keys = set()
+        for nxt in lines[i + 1 :]:
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            km = re.match(r"^\s+([a-z-]+):", nxt)
+            if km:
+                keys.add(km.group(1))
+        return bool(keys & {"tags", "tags-ignore"}) and not (keys & {"branches", "branches-ignore"})
+    return False
 
 
 def _action_runtime(ctx: Context, ref: str) -> str | None:
@@ -109,6 +131,7 @@ def check_ci(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
         return r
     rows = []
     run_ok = True
+    repo_total: int | None = None  # リポジトリ全体の実行回数（必要になったときだけ取る）
     for w in workflows:
         wid, path, state = w.get("id"), w.get("path"), w.get("state")
         row = {"id": wid, "name": w.get("name"), "path": path, "state": state}
@@ -157,14 +180,27 @@ def check_ci(ctx: Context, repo: Repo, inv: Inventory) -> CheckResult:
                 r.verified_scopes.remove(f"ci:{repo.id}:{wid}")
                 continue
             wf = parse_workflow(text)
-            if set(wf["triggers"]) & {"push", "schedule"}:
-                r.findings.append(_f(repo, f"ci-never-run:{repo.id}:{wid}", LOW, f"[CI] {repo.name}: {w.get('name')} が一度も実行されていない",
-                                     "push/schedule トリガーがあるのに実行履歴が 0 件。リポジトリの Actions が無効になっている可能性がある",
-                                     [f"{repo.html_url}/actions"], "Settings → Actions で有効か確認し、意図どおりなら手動実行で動作を確かめる",
-                                     {"path": path}, [f"ci:{repo.id}:{wid}"],
-                                     unverified=["Actions の有効設定はリポジトリ管理者しか API で読めないため、無効かどうかは推定"]))
-            else:
-                r.notes.append(f"{path}: 実行履歴なし（手動・PR トリガーのみ）")
+            expected = "schedule" in wf["triggers"] or ("push" in wf["triggers"] and not wf["push_tags_only"])
+            if not expected:
+                r.notes.append(f"{path}: 実行履歴なし（タグ・手動・PR トリガーのみ。条件が成立するまでは正常）")
+                continue
+            if repo_total is None:
+                try:
+                    repo_total = ctx.reader.repo_runs_total(repo.full_name)
+                except HttpError as e:
+                    run_ok = False
+                    r.fail(f"リポジトリ全体の実行履歴を取得できない: {e.kind}")
+                    r.verified_scopes.remove(f"ci:{repo.id}:{wid}")
+                    continue
+            if repo_total > 0:
+                # 他のワークフローは動いている＝Actions は有効。トリガー条件（paths・branches 等）が未成立なだけ
+                r.notes.append(f"{path}: 実行履歴なし（リポジトリでは {repo_total} 回実行あり。トリガー条件が未成立の可能性）")
+                continue
+            r.findings.append(_f(repo, f"ci-never-run:{repo.id}:{wid}", LOW, f"[CI] {repo.name}: {w.get('name')} が一度も実行されていない",
+                                 "push/schedule トリガーがあるのに、このリポジトリでは Actions の実行が 1 回も無い。Actions が無効になっている可能性がある",
+                                 [f"{repo.html_url}/actions"], "Settings → Actions で有効か確認し、意図どおりなら手動実行で動作を確かめる",
+                                 {"path": path}, [f"ci:{repo.id}:{wid}"],
+                                 unverified=["Actions の有効設定はリポジトリ管理者しか API で読めないため、無効かどうかは推定"]))
     r.data["workflows"] = rows
     static_ok = _static(ctx, repo, inv, r)
     if run_ok and static_ok:
