@@ -1,4 +1,26 @@
 {
   "_説明": "誤検知・保留・リスク受容の記録。key は Issue 本文の maint-key。status は false_positive / snoozed / risk_accepted。snoozed と risk_accepted は until（再評価日 YYYY-MM-DD）必須。書式は README「誤検知の抑制」",
-  "suppressions": []
+  "suppressions": [
+    {
+      "key": "vuln:1164599744:GHSA-w5hq-g745-h8pq",
+      "status": "risk_accepted",
+      "until": "2027-04-30",
+      "by": "claude（保守の修正の委任による。okakanatto/Yarukoto#2 で更新した後の残り）",
+      "reason": "uuid 8.3.2 は exceljs 4.4.0（最新版）が uuid ^8.3.0 を要求するため更新できない。勧告は v3/v5/v6 に buf を渡す使い方が対象だが、exceljs は uuidv4() を引数なしで使うだけ（lib/xlsx/xform/sheet/cf-ext/cf-rule-ext-xform.js）で、アプリ自身は uuid を使わない。exceljs の更新時に再確認"
+    },
+    {
+      "key": "vuln:1164599744:RUSTSEC-2023-0071",
+      "status": "risk_accepted",
+      "until": "2027-04-30",
+      "by": "claude（保守の修正の委任による。okakanatto/Yarukoto#2 で更新した後の残り）",
+      "reason": "rsa 0.9.10（Marvin Attack、修正版なし）は Cargo.lock に載るが Windows 向けの依存木に含まれない（cargo tree -i rsa --target x86_64-pc-windows-msvc が 0 件。tauri-plugin-sql の未使用の MySQL 機能経由）。Windows 以外のビルドを始めるときに再確認"
+    },
+    {
+      "key": "vuln:1164599744:GHSA-wrw7-89jp-8q8g",
+      "status": "risk_accepted",
+      "until": "2027-04-30",
+      "by": "claude（保守の修正の委任による。okakanatto/Yarukoto#2 で更新した後の残り）",
+      "reason": "glib 0.18.5（RUSTSEC-2024-0429）は Linux の GUI 部品（gtk）経由で、Windows 向けの依存木に含まれない（cargo tree -i glib --target x86_64-pc-windows-msvc が 0 件）。Tauri が gtk-rs 0.18 を使う間は更新できない。Linux ビルドを始めるときに再確認"
+    }
+  ]
 }
