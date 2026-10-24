@@ -119,6 +119,8 @@ def render_markdown(rep: dict, issue_url_base: str | None = None, dashboard: boo
         info.append(f"- 名前変更: {e['old']} → {e['name']}（ID {e['id']} で履歴を引き継ぎ）")
     for e in disc.get("excluded", []):
         info.append(f"- 除外: {e['name']}（{e['reason']}）")
+    for e in disc.get("retired", []):
+        info.append(f"- 監視を終了: {e['name']}（ID {e['id']}、設定で除外）")
     lines.append("## 情報（Issue にしない事項）")
     lines += info[:80] or ["- なし"]
     lines.append("")

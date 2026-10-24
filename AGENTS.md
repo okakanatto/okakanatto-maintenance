@@ -65,6 +65,12 @@
 
 対象: 保守 Issue の解消に要る変更（依存の更新、CI・アクションの更新、EOL 対応）と、Dependabot が作った PR の取り込み。機能追加はしない。
 
+**配布用スナップショットのリポジトリは直接直さない**（ユーザーの決定 2026-10-24）。`config/maintenance.json` の `repo_policies.<名前>.distribution_snapshot` が true のリポジトリ（Issue 本文に「修正先」が出る。例: Recolign）は、開発用の非公開リポジトリから書き出した写しで、直接直すと次の書き出しで上書きされる（デグレ）。
+- 修正は開発用リポジトリで行う。対応表は中央の Actions 変数 `MAINT_FIX_REPOS`（非公開）: `gh variable get MAINT_FIX_REPOS -R okakanatto/okakanatto-maintenance`
+- 下の手順 1〜6 を開発用リポジトリで行い、そのリポジトリのルール（CLAUDE.md・書き出しの手順）に従う
+- 公開側への書き出しは版の公開に当たるのでしない（ユーザーが判断）。中央の Issue は、書き出された後の監視で自動で閉じる
+- 中央の Issue・コメント・コミットメッセージ・中央のファイルには、開発用リポジトリの名前を書かない（中央は公開リポジトリ）
+
 手順:
 1. 対象アプリのルールを読んで従う: `CLAUDE.md`・`AGENTS.md`・`CONTRIBUTING.md`・PR テンプレート・`.githooks` 等
 2. 中央の `work/<アプリ名>`（git 管理外）に GitHub から clone する。既にあれば `git fetch` して既定ブランチの最新から始める

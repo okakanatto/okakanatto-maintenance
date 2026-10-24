@@ -112,6 +112,8 @@ class Finding:
     verify: list[str] = field(default_factory=list)
     # 細かい単位（勧告 1 件など）の抑制で、中身がすべて抑制中になった Finding。Issue は作らず、既存なら抑制ラベルを付ける
     suppressed: bool = False
+    # 修正先の注意（配布用スナップショットのリポジトリ等）。内容の変化ではないので fingerprint には入れない
+    fix_note: str = ""
 
     def fingerprint(self) -> str:
         # タイトル（リポジトリ名を含む）は入れない。リネームだけで「内容が変わった」と通知しないため
@@ -140,6 +142,7 @@ class Finding:
             "issue": self.issue,
             "verify": self.verify,
             "suppressed": self.suppressed,
+            "fix_note": self.fix_note,
             "fingerprint": self.fingerprint(),
         }
 

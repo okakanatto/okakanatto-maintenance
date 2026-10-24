@@ -24,6 +24,8 @@ from .model import ERROR, LOW, MEDIUM, PARTIAL, SKIPPED, SUCCESS, CheckResult, F
 from .report import render_markdown, worst_status
 
 PERIODS = ("daily", "weekly", "monthly")
+# repo_policies.<名前>.distribution_snapshot が true のリポジトリの Issue に出す注意（開発用リポジトリの名前は公開しない）
+SNAPSHOT_NOTE = "このリポジトリは配布用のスナップショット（開発用の非公開リポジトリから書き出している）。ここを直接直すと次の書き出しで上書きされるため、修正は開発用リポジトリで行う（AGENTS.md 6 章）"
 
 
 @dataclass
@@ -164,7 +166,10 @@ def run(ctx: Context, writer: IssueWriter | None, opts: RunOptions) -> dict:
                 errors.append(f"{repo.name}/{name}: {type(e).__name__}: {e}")
                 tracebacks.append(traceback.format_exc(limit=5))
                 results[name] = cr
+        fix_note = SNAPSHOT_NOTE if policy.get("distribution_snapshot") else ""
         for name, cr in results.items():
+            for f in cr.findings:
+                f.fix_note = fix_note
             findings += cr.findings
             verified |= set(cr.verified_scopes)
             if cr.status != SKIPPED:

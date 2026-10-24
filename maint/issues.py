@@ -106,6 +106,7 @@ def render_body(f: Finding, meta: dict, run_url: str | None) -> str:
     lines = [
         "## 概要",
         f"- 対象: {f.repo_name or '中央監視'}" + (f"（リポジトリ ID {f.repo_id}）" if f.repo_id else ""),
+        *([f"- **修正先**: {neutralize(f.fix_note)}"] if f.fix_note else []),
         f"- 種別: {f.kind} ／ 重要度: **{sev}** ／ 対応目安: {due_s}",
         "",
         neutralize(f.summary),
@@ -283,7 +284,7 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
                 res.observe("suppressed_not_created", f.key, status=sup.status if sup else "advisory", until=str(sup.until) if sup else "")
                 continue
             meta = {"key": f.key, "fp": f.fingerprint(), "sev": f.severity, "verify": f.verify, "aliases": f.aliases,
-                    "first_seen": now_iso, "last_refreshed": now_iso, "material": f.material}
+                    "first_seen": now_iso, "last_refreshed": now_iso, "material": f.material, "fix_note": f.fix_note}
             body = render_body(f, meta, run_url)
             created = writer.create_issue(neutralize(f.title), body, labels_for(f, False))
             num = (created or {}).get("number")
@@ -331,10 +332,12 @@ def sync(writer: IssueWriter, cfg: Config, issues: list[dict], findings: list[Fi
         label_change = bool(stale or missing)
         refresh_due = _older_than(old.get("last_refreshed"), now, refresh_days)
         title_change = iss.get("title") != neutralize(f.title)
-        if fp_changed or refresh_due or label_change or title_change:
+        note_change = old.get("fix_note", "") != f.fix_note  # 修正先の注意が増減した（本文だけ直し、通知はしない）
+        meta["fix_note"] = f.fix_note
+        if fp_changed or refresh_due or label_change or title_change or note_change:
             meta["last_refreshed"] = now_iso
             writer.update_issue(num, title=neutralize(f.title), body=render_body(f, meta, run_url), labels=sorted((labels - stale) | want_labels))
-            res.act("update", key, num, reason=",".join(x for x, c in (("内容", fp_changed), ("定期更新", refresh_due), ("ラベル", label_change), ("題名", title_change)) if c))
+            res.act("update", key, num, reason=",".join(x for x, c in (("内容", fp_changed), ("定期更新", refresh_due), ("ラベル", label_change), ("題名", title_change), ("修正先", note_change)) if c))
         if SUPPRESSED in labels and not active:
             when = f"（期限 {sup.until}）" if sup and sup.until else ""
             writer.comment(num, f"抑制の再評価期限を過ぎました{when}。内容を確認し、対応するか suppressions.json を更新してください。")

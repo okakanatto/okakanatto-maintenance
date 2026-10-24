@@ -3,9 +3,15 @@
   "central_repo": "okakanatto-maintenance",
   "exclude": {
     "names": [],
-    "ids": []
+    "ids": [
+      1416692907
+    ]
   },
-  "repo_policies": {},
+  "repo_policies": {
+    "Recolign": {
+      "distribution_snapshot": true
+    }
+  },
   "issue_policy": {
     "vuln_min_severity": "low",
     "dev_only_downgrade": true,

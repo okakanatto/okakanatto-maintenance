@@ -36,6 +36,7 @@ class DiscoveryResult:
     new: list[Repo] = field(default_factory=list)
     renamed: list[tuple[Repo, str]] = field(default_factory=list)  # (repo, 旧 full_name)
     missing: list[dict] = field(default_factory=list)  # {id, name, state, detail}
+    retired: list[dict] = field(default_factory=list)  # 一覧から消え、設定で除外した（監視を終えた）もの {id, name}
     returned: list[Repo] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     listed_count: int = 0
@@ -50,6 +51,7 @@ class DiscoveryResult:
             "renamed": [{"id": r.id, "name": r.full_name, "old": old} for r, old in self.renamed],
             "missing": self.missing,
             "returned": [{"id": r.id, "name": r.full_name} for r in self.returned],
+            "retired": self.retired,
             "errors": self.errors,
         }
 
@@ -105,6 +107,9 @@ def discover(reader: GitHubReader, cfg: Config, state: dict, only: list[str] | N
         if rid in seen or prev.get("status") not in ("active", "missing"):
             continue
         entry = {"id": int(rid), "name": prev.get("full_name", "?")}
+        if cfg.excluded(int(rid), prev.get("name", "")):
+            res.retired.append(entry)  # 消失の確認をしない（監視不能として毎回出さない）
+            continue
         try:
             d = reader.repo_by_id(int(rid))
         except HttpError as e:
@@ -153,3 +158,8 @@ def apply_to_state(res: DiscoveryResult, state: dict, now_iso: str) -> None:
         if e is not None:
             e["status"] = "missing"
             e["status_detail"] = m["state"]
+    for m in res.retired:
+        e = repos.get(str(m["id"]))
+        if e is not None:
+            e["status"] = "excluded"
+            e["status_detail"] = "設定で除外（一覧から消えた後）"

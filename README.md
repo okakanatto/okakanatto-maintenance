@@ -34,7 +34,7 @@ GitHub Actions が毎日自動で動き、PC の電源や Claude Code の起動�
 gh repo create okakanatto/okakanatto-maintenance --private --source . --push
 gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 ```
-公開（`--public`）でも動きますが、公開リポジトリの定期実行は 60 日無活動で止まることがあります（「監視停止」）。非公開なら対象外で、Actions の無料枠（Free プランで月 2,000 分）に対し使用量は月 100 分程度の見込みです。
+**このリポジトリは公開で運用します**（2026-10-24 に非公開から切り替え）。非公開リポジトリの Actions はアカウント共通の無料枠（Free プランで月 2,000 分）を使うため、他の非公開リポジトリの CI が枠を使い切ると監視も止まります（2026-10 に実際に発生）。公開リポジトリの Actions は無料・上限なしです。その代わり、定期実行が 60 日無活動で止まることがあり（「監視停止」）、保守 Issue の内容も公開されます。
 
 ## 日常の運用
 
@@ -50,7 +50,9 @@ gh workflow run maintenance -R okakanatto/okakanatto-maintenance -f checks=all
 **何もしなくてよい**です。`okakanatto` の公開リポジトリとして push すれば、次回の監視（翌朝）で自動発見され、
 周期に関係なく全検査（初回棚卸し）を受けて監視に入ります。問題がなければ通知は来ず、ダッシュボードに「新規」と表示されます。
 
-- 監視したくないリポジトリは `config/maintenance.json` の `exclude`（名前または ID）へ
+- 監視したくないリポジトリは `config/maintenance.json` の `exclude`（名前または ID）へ。一覧から消えたリポジトリも、ID を `exclude.ids` に入れれば「監視不能」と出し続けずに監視を終えます
+- **開発用（非公開）と配布用（公開）を分けているアプリ**は、配布用を `repo_policies` で `"distribution_snapshot": true` にし、対応表を Actions 変数 `MAINT_FIX_REPOS` に入れます（`gh variable set MAINT_FIX_REPOS -R okakanatto/okakanatto-maintenance --body '{"配布用": "okakanatto/開発用"}'`）。Issue 本文に「修正先は開発用リポジトリ」と出て、AI は開発用で直します（AGENTS.md 6 章）。開発用リポジトリの名前は公開の場所（このリポジトリのファイル・Issue）に書きません
+- そうしたアプリでは、Dependabot は**開発用リポジトリで**有効にしてください。配布用で PR をマージしても、次の書き出しで元に戻ります
 - fork・archive 済み・非公開・このリポジトリ自身は自動で除外
 - 空のリポジトリは異常ではなく「コード未登録」として扱います
 - リポジトリ名を変えても数値 ID で追跡するので、Issue は引き継がれます
@@ -179,7 +181,7 @@ GITHUB_TOKEN=$(gh auth token) python -m maint run --dry-run --checks all --repor
 
 ## 設定ファイル
 
-- `config/maintenance.json` — 所有者・除外・個別ポリシー（`repo_policies`: `ignore_paths` や `issue_policy` の上書き）・判定基準・定期点検項目
+- `config/maintenance.json` — 所有者・除外・個別ポリシー（`repo_policies`: `ignore_paths`・`issue_policy` の上書き・`distribution_snapshot`）・判定基準・定期点検項目
 - `config/suppressions.json` — 誤検知・保留・リスク受容
 - 変更したら `python -m maint validate` で検証（push 時の tests ワークフローでも検証されます）
 

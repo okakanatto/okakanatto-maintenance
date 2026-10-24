@@ -1,5 +1,6 @@
 """独立レビュー（2026-10-17）で見つかった欠陥の再発防止テスト。番号はレビューの指摘番号。"""
 
+import copy
 import json
 import unittest
 
@@ -257,6 +258,45 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIsNone(r.by_key("ci-never-run:205:1"))  # タグ push 専用
         self.assertIsNone(r.by_key("ci-never-run:205:2"))  # 他は動いている（paths 条件が未成立なだけ）
         self.assertIsNotNone(r.by_key("ci-never-run:102:9001"))  # Actions が一度も動いていないリポジトリは引き続き指摘
+
+    def test_19_distribution_snapshot_shows_fix_location_without_notifying(self):
+        """配布用スナップショット（開発用の非公開リポジトリから書き出す公開リポジトリ）の修正先表示。2026-10-24"""
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run()
+        n = r.by_key("vuln:101:npm:prod")["number"]
+        self.assertNotIn("修正先", w.issue(n)["body"])
+        cfg = copy.deepcopy(r.cfg)
+        cfg.raw["repo_policies"] = {"AppA": {"distribution_snapshot": True}}
+        r.cfg = cfg
+        w.log.clear()
+        r.run()
+        body = w.issue(n)["body"]
+        self.assertIn("**修正先**", body)
+        self.assertIn("開発用の非公開リポジトリ", body)
+        self.assertEqual(w.comments.get(n, []), [])  # 本文だけ直し、コメント（通知）はしない
+        w.log.clear()
+        r.run()
+        self.assertEqual([x for x in w.writes() if f"/issues/{n}" in x[1]], [])  # 2 回目は何もしない
+
+    def test_20_excluded_after_disappearing_is_retired_not_missing(self):
+        """一覧から消えたリポジトリを設定で除外したら、監視不能として毎回出さない。2026-10-24"""
+        w = W.build_world()
+        r = W.Runner(w)
+        r.run()
+        w.hidden.add(102)
+        r.run()
+        n = r.by_key("lifecycle:102:missing")["number"]
+        w.issue(n)["state"] = "closed"  # 人が閉じた
+        cfg = copy.deepcopy(r.cfg)
+        cfg.raw["exclude"] = {"names": [], "ids": [102]}
+        r.cfg = cfg
+        rep = r.run()
+        self.assertEqual(rep["discovery"]["missing"], [])
+        self.assertEqual([x["id"] for x in rep["discovery"]["retired"]], [102])
+        self.assertEqual(rep["state"]["repos"]["102"]["status"], "excluded")
+        self.assertFalse(any(f["key"] == "lifecycle:102:missing" for f in rep["findings"]))
+        self.assertNotIn("監視不能", rep["markdown"].split("## 監視できていない範囲")[1].split("##")[0])
 
     def test_state_keeps_initial_inventory(self):
         w = W.build_world()
