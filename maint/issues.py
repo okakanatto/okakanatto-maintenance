@@ -168,16 +168,160 @@ def _is_verified(token: str, verified: set[str]) -> bool:
     return f"{prefix}:*" in verified
 
 
+_ADV_ID = re.compile(r"^(GHSA|RUSTSEC|PYSEC|GO|CVE|OSV)-[\w-]+$")
+_LIST_LABELS = {"ids": "上流の勧告", "items": "項目", "files": "ファイル"}
+_SCALAR_LABELS = {
+    "where": "範囲", "state": "状態", "conclusion": "最新の実行結果", "lag": "メジャー版の遅れ", "version": "版",
+    "deprecated": "非推奨", "cycle": "サイクル", "product": "製品", "label": "ランナー", "path": "ワークフロー",
+    "from_major": "使用中のメジャー版", "check": "検査", "runtime": "実行環境",
+}
+_MAX_ITEMS = 10
+
+
+def _adv(i: str) -> str:
+    i = str(i)
+    return f"[{i}](https://osv.dev/vulnerability/{i})" if _ADV_ID.match(i) else f"`{neutralize(i)}`"
+
+
+def _code(x) -> str:
+    return "`" + neutralize(str(x)).replace("`", "") + "`"
+
+
+def _join(items: list, fmt) -> str:
+    shown = "、".join(fmt(x) for x in items[:_MAX_ITEMS])
+    return shown + (f" ほか {len(items) - _MAX_ITEMS} 件" if len(items) > _MAX_ITEMS else "")
+
+
+def _where_ja(w) -> str:
+    """'main+v1.0.0' → '最新ソース（main）と配布中の v1.0.0'"""
+    if not w:
+        return "（検出なし）"
+    parts = str(w).split("+")
+    tags = [p for p in parts if p != "main"]
+    if "main" in parts and tags:
+        return f"最新ソース（main）と配布中の {tags[0]}"
+    if "main" in parts:
+        return "最新ソース（main）のみ"
+    return f"配布中の {tags[0]} のみ（最新ソースでは解消済み）"
+
+
+def _split_pkg(s: str) -> tuple[str, str]:
+    name, sep, ver = str(s).rpartition("@")
+    return (name, ver) if sep and name else (str(s), "")
+
+
+def _package_lines(old: list, new: list) -> list[str]:
+    om: dict[str, list[str]] = {}
+    nm: dict[str, list[str]] = {}
+    for s in old or []:
+        n, v = _split_pkg(s)
+        om.setdefault(n, []).append(v)
+    for s in new or []:
+        n, v = _split_pkg(s)
+        nm.setdefault(n, []).append(v)
+    lines = []
+    updated = [n for n in sorted(set(om) & set(nm)) if sorted(om[n]) != sorted(nm[n])]
+    if updated:
+        lines.append("版が変わったパッケージ: " + _join(updated, lambda n: f"{_code(n)} {'・'.join(sorted(om[n]))} → {'・'.join(sorted(nm[n]))}"))
+    gone = sorted(set(om) - set(nm))
+    if gone:
+        lines.append(f"対象から外れたパッケージ（解消・抑制を含む）{len(gone)} 件: " + _join(gone, lambda n: f"{_code(n)} {'・'.join(sorted(om[n]))}"))
+    came = sorted(set(nm) - set(om))
+    if came:
+        lines.append(f"新たに該当したパッケージ {len(came)} 件: " + _join(came, lambda n: f"{_code(n)} {'・'.join(sorted(nm[n]))}"))
+    return lines
+
+
+def _advisory_lines(om: dict, nm: dict) -> list[str]:
+    oa, na = list(om.get("advisories") or []), list(nm.get("advisories") or [])
+    os_, ns = list(om.get("suppressed") or []), list(nm.get("suppressed") or [])
+    lines = []
+    if len(oa) != len(na):
+        lines.append(f"勧告の件数: {len(oa)} 件 → {len(na)} 件")
+    added = [x for x in na if x not in oa and x not in os_]
+    if added:
+        lines.append(f"増えた勧告 {len(added)} 件: " + _join(added, _adv))
+    from_sup = [x for x in na if x not in oa and x in os_]
+    if from_sup:
+        lines.append(f"抑制が外れて戻った勧告 {len(from_sup)} 件: " + _join(from_sup, _adv))
+    to_sup = [x for x in oa if x not in na and x in ns]
+    if to_sup:
+        lines.append(f"抑制した勧告（suppressions.json）{len(to_sup)} 件: " + _join(to_sup, _adv))
+    fixed = [x for x in oa if x not in na and x not in ns]
+    if fixed:
+        lines.append(f"解消した勧告 {len(fixed)} 件: " + _join(fixed, _adv))
+    new_sup = [x for x in ns if x not in os_ and x not in oa]  # 前回は対象外だった勧告をいきなり抑制
+    if new_sup:
+        lines.append(f"抑制中の勧告が増えた {len(new_sup)} 件: " + _join(new_sup, _adv))
+    return lines
+
+
+def _dict_lines(label: str, old: dict, new: dict) -> list[str]:
+    old, new = old or {}, new or {}
+    lines = []
+    came = [k for k in sorted(new) if k not in old]
+    gone = [k for k in sorted(old) if k not in new]
+    changed = [k for k in sorted(set(old) & set(new)) if old[k] != new[k]]
+    if came:
+        lines.append(f"{label}が増えた: " + _join(came, _code))
+    if gone:
+        lines.append(f"{label}が解消: " + _join(gone, _code))
+    for k in changed[:_MAX_ITEMS]:
+        ov, nv = old[k], new[k]
+        if isinstance(ov, dict) and isinstance(nv, dict):
+            diffs = [f"{_SCALAR_LABELS.get(x, x)} {_brief(ov.get(x))} → {_brief(nv.get(x))}" for x in sorted(set(ov) | set(nv)) if ov.get(x) != nv.get(x)]
+            lines.append(f"{_code(k)}: " + "、".join(diffs))
+        else:
+            lines.append(f"{_code(k)}: {_brief(ov)} → {_brief(nv)}")
+    return lines
+
+
+def _brief(v) -> str:
+    if isinstance(v, list):
+        return "・".join(neutralize(str(x)) for x in v[:5]) + (" ほか" if len(v) > 5 else "") if v else "なし"
+    if isinstance(v, bool):
+        return "はい" if v else "いいえ"
+    return neutralize(str(v)) if v not in (None, "") else "なし"
+
+
 def _change_summary(old: dict, f: Finding) -> str:
-    parts = []
+    """前回と今回の material を比べ、人が読める変化の箇条書きにする（一覧を途中で切らない。長い一覧は件数＋先頭 10 件）。"""
+    lines: list[str] = []
     if old.get("sev") and old["sev"] != f.severity:
-        parts.append(f"重要度 {SEVERITY_JA.get(old['sev'], old['sev'])} → {SEVERITY_JA[f.severity]}")
-    om, nm = old.get("material") or {}, f.material
-    for k in sorted(set(om) | set(nm)):
-        if om.get(k) != nm.get(k):
-            ov, nv = json.dumps(om.get(k), ensure_ascii=False)[:120], json.dumps(nm.get(k), ensure_ascii=False)[:120]
-            parts.append(f"{k}: `{neutralize(ov)}` → `{neutralize(nv)}`")
-    return "\n".join(f"- {p}" for p in parts[:10]) or "- 検出内容が変わった"
+        lines.append(f"重要度: {SEVERITY_JA.get(old['sev'], old['sev'])} → {SEVERITY_JA[f.severity]}")
+    om, nm = old.get("material") or {}, f.material or {}
+    done = {"merged"}
+    if "advisories" in om or "advisories" in nm:
+        lines += _advisory_lines(om, nm)
+        done |= {"advisories", "suppressed"}
+    if om.get("packages") != nm.get("packages") and ("packages" in om or "packages" in nm):
+        lines += _package_lines(om.get("packages"), nm.get("packages"))
+    done.add("packages")
+    if om.get("where") != nm.get("where") and ("where" in om or "where" in nm):
+        lines.append(f"範囲: {_where_ja(om.get('where'))} → {_where_ja(nm.get('where'))}")
+        if nm.get("where") and "main" not in str(nm.get("where")).split("+"):
+            lines.append("→ 最新ソースでは解消済み。新しい版をリリースすると、次の監視でこの Issue は自動で閉じます")
+    done.add("where")
+    for k in sorted((set(om) | set(nm)) - done):
+        ov, nv = om.get(k), nm.get(k)
+        if ov == nv:
+            continue
+        label = _SCALAR_LABELS.get(k) or _LIST_LABELS.get(k) or k
+        if isinstance(ov, list) or isinstance(nv, list):
+            ol, nl = list(ov or []), list(nv or [])
+            came, gone = [x for x in nl if x not in ol], [x for x in ol if x not in nl]
+            fmt = _adv if k == "ids" else _code
+            if came:
+                lines.append(f"{label}が増えた {len(came)} 件: " + _join(came, fmt))
+            if gone:
+                lines.append(f"{label}が減った {len(gone)} 件: " + _join(gone, fmt))
+        elif isinstance(ov, dict) or isinstance(nv, dict):
+            lines += _dict_lines({"actions": "該当アクション"}.get(k, label), ov if isinstance(ov, dict) else {}, nv if isinstance(nv, dict) else {})
+        else:
+            lines.append(f"{label}: {_brief(ov)} → {_brief(nv)}")
+    if not lines and om.get("merged") != nm.get("merged"):
+        lines.append("検出の根拠になったファイルの内訳が変わった")
+    return "\n".join(f"- {x}" for x in lines[:30]) or "- 検出内容が変わった（細部のみ）"
 
 
 # --- 同期 ----------------------------------------------------------------

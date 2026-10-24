@@ -179,7 +179,7 @@ class IssueSyncTests(unittest.TestCase):
         iss = w.issue(n)
         self.assertEqual(iss["state"], "open")
         self.assertIn("v1.0.0", iss["body"])
-        self.assertTrue(any("where" in c["body"] for c in w.comments.get(n, [])))  # 範囲の変化を 1 回コメント
+        self.assertTrue(any("範囲: 最新ソース（main）と配布中の v1.0.0 → 配布中の v1.0.0 のみ" in c["body"] for c in w.comments.get(n, [])))  # 範囲の変化を 1 回コメント
         # OSV が落ちている日は、検出が消えても閉じない
         w.repos[101].tags["v1.1.0"] = fixed
         w.repos[101].releases.insert(0, {"tag_name": "v1.1.0", "draft": False, "prerelease": False, "published_at": "2026-10-20T00:00:00Z", "assets": []})

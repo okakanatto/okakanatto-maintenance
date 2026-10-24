@@ -298,6 +298,42 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertFalse(any(f["key"] == "lifecycle:102:missing" for f in rep["findings"]))
         self.assertNotIn("監視不能", rep["markdown"].split("## 監視できていない範囲")[1].split("##")[0])
 
+    def test_21_change_comment_is_readable(self):
+        """変化のコメントを「増えた・解消・抑制・版の変化・範囲」で書く（JSON の途中切れにしない）。2026-10-24"""
+        from maint.issues import _change_summary
+        from maint.model import Finding
+
+        many_old = [f"GHSA-old{i:02d}" for i in range(15)]
+        old = {"sev": "critical", "material": {
+            "advisories": many_old + ["GHSA-keep", "GHSA-gone", "GHSA-sup"],
+            "packages": ["next@16.1.6", "@scope/pkg@1.0.0", "leftpad@1.0.0"],
+            "where": "main+v2.0.0",
+        }}
+        f = Finding(key="vuln:1:npm:prod", kind="vuln", repo_id=1, repo_name="A", title="t", severity="high", summary="s",
+                    material={"advisories": ["GHSA-keep", "GHSA-new"], "suppressed": ["GHSA-sup"],
+                              "packages": ["next@16.4.3", "@scope/pkg@1.0.0", "uuid@8.3.2"], "where": "v2.0.0"})
+        text = _change_summary(old, f)
+        self.assertIn("重要度: Critical → High", text)
+        self.assertIn("勧告の件数: 18 件 → 2 件", text)
+        self.assertIn("増えた勧告 1 件: [GHSA-new](https://osv.dev/vulnerability/GHSA-new)", text)
+        self.assertIn("抑制した勧告（suppressions.json）1 件: [GHSA-sup]", text)
+        self.assertIn("解消した勧告 16 件:", text)
+        self.assertIn("ほか 6 件", text)  # 先頭 10 件＋残りの件数（途中で切らない）
+        self.assertIn("版が変わったパッケージ: `next` 16.1.6 → 16.4.3", text)
+        self.assertIn("対象から外れたパッケージ（解消・抑制を含む）1 件: `leftpad` 1.0.0", text)
+        self.assertIn("新たに該当したパッケージ 1 件: `uuid` 8.3.2", text)
+        self.assertNotIn("@scope", text)  # 変化していないものは出さない
+        self.assertIn("範囲: 最新ソース（main）と配布中の v2.0.0 → 配布中の v2.0.0 のみ（最新ソースでは解消済み）", text)
+        self.assertIn("新しい版をリリースすると", text)
+        self.assertNotIn('`["', text)  # JSON のまま貼らない
+        ci_old = {"material": {"actions": {"actions/checkout": {"runtime": "node20", "refs": ["v4"]}}}}
+        ci_new = Finding(key="ci-action:1", kind="ci", repo_id=1, repo_name="A", title="t", severity="medium", summary="s",
+                         material={"actions": {"actions/checkout": {"runtime": "node20", "refs": ["v4", "v4.1"]},
+                                               "actions/setup-node": {"runtime": "node20", "refs": ["v4"]}}})
+        ct = _change_summary(ci_old, ci_new)
+        self.assertIn("該当アクションが増えた: `actions/setup-node`", ct)
+        self.assertIn("`actions/checkout`: refs v4 → v4・v4.1", ct)
+
     def test_state_keeps_initial_inventory(self):
         w = W.build_world()
         r = W.Runner(w)
